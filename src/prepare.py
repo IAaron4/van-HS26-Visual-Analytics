@@ -244,17 +244,27 @@ def build_stop_order(con: duckdb.DuckDBPyConnection, stops_glob: str, target: Pa
     """Derive where each station sits along its line, so episodes can follow the route.
 
     A line runs in both directions, and averaging positions over both puts the far end of the
-    route in the middle. So the order is taken from the single most common origin and destination
-    pair only. Stations served by other variants fall back to their overall median position,
-    pushed past the main route so they never sit between two stations they do not lie between.
+    route in the middle, so the order comes from one origin and destination pair only. Stations
+    served by other variants fall back to their overall median position, pushed past the main
+    route so they never sit between two stations they do not lie between.
+
+    That pair is the variant serving the most stations, not the one running most often. An
+    international line like EC is cut at the border by the Swiss filter, and its most frequent
+    Swiss fragment is a single stop at Chiasso, which labelled the line "Chiasso to Chiasso"
+    while the real route runs to Zürich.
+
+    Positions are numbered per trip and day. FAHRT_BEZEICHNER repeats daily, so partitioning by
+    it alone numbered a year of trips in one sequence. The relative order survived that, since
+    every station shifted by the same amount each day, but the numbers meant nothing.
     """
     con.execute(
         f"""
         COPY (
             WITH seq AS (
-                SELECT trip_id, line, bpuic, station,
+                SELECT trip_id, service_day, line, bpuic, station,
                        row_number() OVER (
-                           PARTITION BY trip_id ORDER BY coalesce(arr_sched, dep_sched)
+                           PARTITION BY trip_id, service_day
+                           ORDER BY coalesce(arr_sched, dep_sched)
                        ) AS pos
                 FROM read_parquet('{stops_glob}')
                 WHERE line IS NOT NULL
@@ -262,13 +272,22 @@ def build_stop_order(con: duckdb.DuckDBPyConnection, stops_glob: str, target: Pa
                   AND {SWISS}
             ),
             ends AS (
-                SELECT trip_id, line, arg_min(bpuic, pos) AS origin, arg_max(bpuic, pos) AS dest
-                FROM seq GROUP BY trip_id, line
+                SELECT trip_id, service_day, line,
+                       arg_min(bpuic, pos) AS origin, arg_max(bpuic, pos) AS dest
+                FROM seq GROUP BY trip_id, service_day, line
+            ),
+            variants AS (
+                SELECT s.line, e.origin, e.dest,
+                       count(DISTINCT s.bpuic) AS stations,
+                       count(*)                AS stops
+                FROM seq s JOIN ends e USING (trip_id, service_day)
+                GROUP BY s.line, e.origin, e.dest
             ),
             dominant AS (
-                SELECT line, origin, dest
-                FROM ends GROUP BY line, origin, dest
-                QUALIFY row_number() OVER (PARTITION BY line ORDER BY count(*) DESC) = 1
+                SELECT line, origin, dest FROM variants
+                QUALIFY row_number() OVER (
+                    PARTITION BY line ORDER BY stations DESC, stops DESC
+                ) = 1
             ),
             on_route AS (
                 SELECT s.line, s.bpuic,
@@ -276,7 +295,7 @@ def build_stop_order(con: duckdb.DuckDBPyConnection, stops_glob: str, target: Pa
                        CAST(round(median(s.pos)) AS INTEGER) AS position,
                        count(*)                              AS n_observed
                 FROM seq s
-                JOIN ends e USING (trip_id)
+                JOIN ends e USING (trip_id, service_day)
                 JOIN dominant d ON d.line = s.line AND d.origin = e.origin AND d.dest = e.dest
                 GROUP BY s.line, s.bpuic
             ),

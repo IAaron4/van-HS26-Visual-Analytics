@@ -140,3 +140,13 @@ The formula exists in both SQL and pandas, so `tests/` checks that they flag the
 `figures/before/` holds the current set: the delay distribution by source of the recorded time,
 the daily cancellation question, one incident hour by hour, the same incident along the route,
 and the planned layout.
+
+## AI use
+
+| Tool | What for | Where |
+| --- | --- | --- |
+| Claude | Weighing dataset options against the module requirements | Choice of dataset |
+| Claude | Writing the pipeline and the scoring functions | `src/` |
+| Claude | Checking whether claims in my text hold up | Report |
+
+I write the report text myself.
