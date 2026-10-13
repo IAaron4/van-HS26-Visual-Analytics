@@ -23,6 +23,7 @@ from holoviews import opts
 from holoviews.util.transform import lon_lat_to_easting_northing
 
 import model
+import propagation as prop
 import style
 
 pn.extension("tabulator", sizing_mode="stretch_width")
@@ -32,6 +33,19 @@ PROCESSED = Path(__file__).resolve().parents[1] / "data" / "processed"
 CELLS = PROCESSED / "cells.parquet"
 STATIONS = PROCESSED / "stations.parquet"
 STOP_ORDER = PROCESSED / "stop_order.parquet"
+LEGS = PROCESSED / "legs.parquet"
+
+
+def condition_for(when: pd.Timestamp) -> str:
+    """The bucket a leg was fitted in. Must match CONDITION_SQL in prepare.py."""
+    hour, weekday = when.hour, when.dayofweek
+    if hour < 5 or hour >= 22:
+        return "night"
+    if weekday >= 5:
+        return "weekend"
+    if 6 <= hour <= 8 or 16 <= hour <= 18:
+        return "weekday peak"
+    return "weekday off peak"
 
 # Two contrasting periods rather than the whole year. Summer turns out to be the disrupted one,
 # because most Swiss disruption is planned engineering work rather than weather.
@@ -117,9 +131,17 @@ class Explorer(param.Parameterized):
     )
     basemap = param.Selector(objects=list(BASEMAPS), default="OpenStreetMap")
 
+    # The model. Every one of these refits it rather than filtering its output.
+    pooling = param.Selector(objects=list(prop.POOLING), default="leg")
+    min_obs = param.Integer(60, bounds=(5, 2000), step=5)
+    conditioned = param.Boolean(True)
+    interval_sigma = param.Number(1.96, bounds=(0.5, 3.0), step=0.25)
+    start_from_actual = param.Boolean(True)
+    start_delay_min = param.Number(5.0, bounds=(0.0, 30.0), step=0.5)
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        missing = [p.name for p in (CELLS, STATIONS, STOP_ORDER) if not p.exists()]
+        missing = [p.name for p in (CELLS, STATIONS, STOP_ORDER, LEGS) if not p.exists()]
         if missing:
             raise SystemExit(f"missing {', '.join(missing)} in data/processed. Run prepare.py.")
 
@@ -129,6 +151,10 @@ class Explorer(param.Parameterized):
 
         self._stop_order = self._con.execute(f"SELECT * FROM read_parquet('{STOP_ORDER}')").df()
         self._routes = self._route_labels()
+        # 12 MB, so it lives in memory and every refit is arithmetic over it.
+        self._legs = self._con.execute(f"SELECT * FROM read_parquet('{LEGS}')").df()
+        self._coef_key: tuple | None = None
+        self._coef: pd.DataFrame | None = None
 
         # Everything refresh() touches has to exist first: _build_filters sets `categories`,
         # which fires the watcher.
@@ -291,6 +317,7 @@ class Explorer(param.Parameterized):
         self._shown = found.head(60).assign(
             route=lambda d: d["line"].map(self._routes).fillna(""),
             day=lambda d: d["start"].dt.date,
+            peak_hour=lambda d: d["start"],
             hours=lambda d: ((d["end"] - d["start"]).dt.total_seconds() / 3600 + 1).astype(int),
             stations=lambda d: d["n_stations"],
             severity_h=lambda d: (d["severity_s"] / 3600).round(1),
@@ -306,7 +333,9 @@ class Explorer(param.Parameterized):
         self.table.selection = [0]
         self._draw_detail()
 
-    @param.depends("colour_by", "rows_by", "map_extent", "basemap", watch=True)
+    @param.depends("colour_by", "rows_by", "map_extent", "basemap", "pooling", "min_obs",
+                   "conditioned", "interval_sigma", "start_from_actual", "start_delay_min",
+                   watch=True)
     def _recolour(self) -> None:
         self._draw_detail()
 
@@ -347,9 +376,131 @@ class Explorer(param.Parameterized):
         )
         self.detail[:] = [
             header,
-            pn.Row(self._heatmap(cells, line), self._map(cells, line), height=420),
-            self._profile(cells),
+            self._forecast(cells, line, row),
+            pn.Row(
+                pn.Column("**Episodes on this line that day**", self._episode_strip(cells, line)),
+                pn.Column("**Along the route, hour by hour**", self._heatmap(cells, line)),
+                pn.Column("**Every stop, worst of the day**", self._map(cells, line)),
+                height=420, sizing_mode="stretch_width",
+            ),
         ]
+
+    def _episode_strip(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
+        """The anomaly detector, kept as one of the three panels under the forecast.
+
+        It is no longer the whole tool. It is how you find the line-days worth asking the
+        model about.
+        """
+        same_line = self._shown[self._shown["line"] == line]
+        if same_line.empty:
+            return pn.pane.Markdown("No other episodes on this line.")
+        shown = same_line[["start", "hours", "stations", "severity_h", "started_at"]].head(12)
+        return pn.widgets.Tabulator(
+            shown, height=360, disabled=True, show_index=False, theme="simple",
+        )
+
+    @property
+    def model_params(self) -> prop.Params:
+        return prop.Params(
+            pooling=self.pooling, min_obs=self.min_obs,
+            conditioned=self.conditioned, interval_sigma=self.interval_sigma,
+        )
+
+    def coefficients(self) -> pd.DataFrame:
+        """Refit, cached on the settings that change the fit."""
+        key = (self.pooling, self.min_obs, self.conditioned)
+        if self._coef_key != key:
+            self._coef = prop.fit(self._legs, self.model_params)
+            self._coef_key = key
+        return self._coef
+
+    def _forecast(self, cells: pd.DataFrame, line: str, row: pd.Series) -> pn.viewable.Viewable:
+        """What the model expected along the route against what actually happened.
+
+        The prediction starts at the stop where the delay was first added, with the delay really
+        observed there, and walks the rest of the route. Drawing the observed delays over it
+        turns the panel into one question: did this line behave the way it normally does?
+
+        The band widens with every leg because the variance compounds. Where the band swallows
+        the observed line the model has stopped saying anything useful, and that should be
+        visible rather than hidden behind one confident curve.
+        """
+        peak_hour = pd.Timestamp(row["peak_hour"])
+        condition = condition_for(peak_hour) if self.conditioned else None
+        route = prop.route_legs(self._stop_order, line, condition)
+        if route.empty:
+            return pn.pane.Markdown("No route for this line.")
+
+        snapshot = (
+            cells[cells["hour"] == peak_hour]
+            .groupby("station", as_index=False)["median_delay_s"].median()
+        )
+        observed = dict(zip(snapshot["station"], snapshot["median_delay_s"], strict=True))
+
+        # Start where the delay was first added, if that stop is on the route.
+        names = [route.iloc[0]["from_name"], *route["to_name"].tolist()]
+        origin = row["started_at"] if row["started_at"] in names else names[0]
+        start_at = names.index(origin)
+        remaining = route.iloc[start_at:].reset_index(drop=True)
+        if remaining.empty:
+            remaining, start_at = route, 0
+
+        actual_start = observed.get(origin)
+        if self.start_from_actual and actual_start is not None and not pd.isna(actual_start):
+            start_s = float(actual_start)
+            source = f"the {actual_start / 60:.1f} min actually seen at {origin}"
+        else:
+            start_s = self.start_delay_min * 60
+            source = f"a what-if of {self.start_delay_min:.1f} min at {origin}"
+
+        predicted = prop.predict_route(remaining, start_s, self.coefficients(), self.model_params)
+        predicted["step"] = range(len(predicted))
+        predicted["actual_min"] = [
+            (observed.get(s) / 60 if observed.get(s) is not None
+             and not pd.isna(observed.get(s)) else float("nan"))
+            for s in predicted["station"]
+        ]
+        for column in ("delay_s", "lower_s", "upper_s"):
+            predicted[column.replace("_s", "_min")] = (predicted[column] / 60).round(2)
+
+        ticks = [(i, s) for i, s in enumerate(predicted["station"]) if i % max(1, len(predicted) // 14) == 0]
+        hover = HoverTool(tooltips=[
+            ("", "@station"),
+            ("model expects", "@delay_min{0.0} min"),
+            ("range", "@lower_min{0.0} to @upper_min{0.0}"),
+            ("actually", "@actual_min{0.0} min"),
+            ("carried forward", "@a{0.00}"),
+            ("fitted at", "@level"),
+        ])
+        vdims = ["station", "delay_min", "lower_min", "upper_min", "actual_min", "a", "level"]
+
+        band = hv.Area(
+            predicted, "step", ["lower_min", "upper_min"]
+        ).opts(color=style.SERIES[0], alpha=0.16, line_alpha=0)
+        centre = hv.Curve(predicted, "step", "delay_min").opts(
+            color=style.SERIES[0], line_width=2.5)
+        marks = hv.Scatter(predicted, "step", vdims).opts(
+            color=style.SERIES[0], size=5, tools=[hover],
+            line_color=style.SURFACE, line_width=1)
+        truth = hv.Curve(predicted.dropna(subset=["actual_min"]), "step", "actual_min").opts(
+            color=style.SERIES[1], line_width=2.5, line_dash="dashed")
+        zero = hv.HLine(0).opts(color=style.INK_SOFT, line_width=0.8, alpha=0.4)
+
+        chart = (zero * band * centre * truth * marks).opts(
+            height=330, responsive=True, show_grid=True,
+            gridstyle={"grid_line_alpha": 0.25}, xticks=ticks, xrotation=35,
+            xlabel="", ylabel="delay (minutes)", fontscale=0.8,
+            title=f"{line} from {origin}, starting from {source}",
+            legend_position="top_left",
+        )
+        caption = pn.pane.Markdown(
+            f"Solid is what the model expects, dashed is what happened at "
+            f"{peak_hour:%H:%M}. The band is {self.interval_sigma:.2f} sigma and widens with "
+            f"every leg, so where it swallows the dashed line the model has run out of things "
+            f"to say.",
+            styles={"font-size": "0.82em", "color": style.INK_SOFT},
+        )
+        return pn.Column(pn.pane.HoloViews(chart, sizing_mode="stretch_width"), caption)
 
     def _heatmap(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
         """The route against the hour, coloured by whichever measure is selected.
@@ -550,8 +701,17 @@ def layout() -> pn.viewable.Viewable:
         pn.widgets.Select.from_param(explorer.param.canton, width=130),
     )
     parameters = pn.Column(
-        "### Parameters",
-        pn.pane.Markdown("How it scores, not what it shows.", styles={"font-size": "0.85em"}),
+        "### Model",
+        pn.pane.Markdown("Each of these refits the model.",
+                         styles={"font-size": "0.85em"}),
+        explorer.param.pooling,
+        explorer.param.min_obs,
+        explorer.param.conditioned,
+        explorer.param.interval_sigma,
+        explorer.param.start_from_actual,
+        explorer.param.start_delay_min,
+        pn.layout.Divider(),
+        "### Finding episodes",
         explorer.param.rank_by,
         explorer.param.z_threshold,
         explorer.param.min_excess_min,
