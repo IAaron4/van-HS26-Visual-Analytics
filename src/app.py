@@ -484,9 +484,11 @@ class Explorer(param.Parameterized):
 
         snapshot = (
             cells[cells["hour"] == peak_hour]
-            .groupby("station", as_index=False)["median_delay_s"].median()
+            .groupby("station", as_index=False)
+            .agg(observed=("median_delay_s", "median"), normal=("base_delay_s", "median"))
         )
-        observed = dict(zip(snapshot["station"], snapshot["median_delay_s"], strict=True))
+        observed = dict(zip(snapshot["station"], snapshot["observed"], strict=True))
+        normal = dict(zip(snapshot["station"], snapshot["normal"], strict=True))
 
         # Start where the delay was first added, if that stop is on the route.
         names = [route.iloc[0]["from_name"], *route["to_name"].tolist()]
@@ -506,11 +508,15 @@ class Explorer(param.Parameterized):
 
         predicted = prop.predict_route(remaining, start_s, self.coefficients(), self.model_params)
         predicted["step"] = range(len(predicted))
-        predicted["actual_min"] = [
-            (observed.get(s) / 60 if observed.get(s) is not None
-             and not pd.isna(observed.get(s)) else float("nan"))
-            for s in predicted["station"]
-        ]
+        def minutes(lookup: dict, station: str) -> float:
+            value = lookup.get(station)
+            return float("nan") if value is None or pd.isna(value) else value / 60
+
+        predicted["actual_min"] = [minutes(observed, s) for s in predicted["station"]]
+        # What this slot normally runs at. This is the baseline the scoring compares against,
+        # and the reason for using robust statistics instead of a learned detector was that it
+        # can be drawn. Until now it never was.
+        predicted["normal_min"] = [minutes(normal, s) for s in predicted["station"]]
         for column in ("delay_s", "lower_s", "upper_s"):
             predicted[column.replace("_s", "_min")] = (predicted[column] / 60).round(2)
 
@@ -520,10 +526,12 @@ class Explorer(param.Parameterized):
             ("model expects", "@delay_min{0.0} min"),
             ("range", "@lower_min{0.0} to @upper_min{0.0}"),
             ("actually", "@actual_min{0.0} min"),
+            ("normal here", "@normal_min{0.0} min"),
             ("carried forward", "@a{0.00}"),
             ("fitted at", "@level"),
         ])
-        vdims = ["station", "delay_min", "lower_min", "upper_min", "actual_min", "a", "level"]
+        vdims = ["station", "delay_min", "lower_min", "upper_min", "actual_min",
+                 "normal_min", "a", "level"]
 
         band = hv.Area(
             predicted, "step", ["lower_min", "upper_min"]
@@ -535,9 +543,11 @@ class Explorer(param.Parameterized):
             line_color=style.SURFACE, line_width=1)
         truth = hv.Curve(predicted.dropna(subset=["actual_min"]), "step", "actual_min").opts(
             color=style.SERIES[1], line_width=2.5, line_dash="dashed")
+        usual = hv.Curve(predicted.dropna(subset=["normal_min"]), "step", "normal_min").opts(
+            color=style.INK_SOFT, line_width=1.4, alpha=0.65, line_dash="dotted")
         zero = hv.HLine(0).opts(color=style.INK_SOFT, line_width=0.8, alpha=0.4)
 
-        chart = (zero * band * centre * truth * marks).opts(
+        chart = (zero * usual * band * centre * truth * marks).opts(
             height=330, responsive=True, show_grid=True,
             gridstyle={"grid_line_alpha": 0.25}, xticks=ticks, xrotation=35,
             xlabel="", ylabel="delay (minutes)", fontscale=0.8,
@@ -551,10 +561,10 @@ class Explorer(param.Parameterized):
                        else round(float(tail["actual_min"]), 2)),
         }
         caption = pn.pane.Markdown(
-            f"Solid is what the model expects, dashed is what happened at "
-            f"{peak_hour:%H:%M}. The band is {self.interval_sigma:.2f} sigma and widens with "
-            f"every leg, so where it swallows the dashed line the model has run out of things "
-            f"to say.",
+            f"Dotted is what this route normally runs at, solid is what the model expects "
+            f"given the start, dashed is what happened at {peak_hour:%H:%M}. The band is "
+            f"{self.interval_sigma:.2f} sigma and widens with every leg, so where it "
+            f"swallows the dashed line the model has run out of things to say.",
             styles={"font-size": "0.82em", "color": style.INK_SOFT},
         )
         return pn.Column(pn.pane.HoloViews(chart, sizing_mode="stretch_width"), caption)
