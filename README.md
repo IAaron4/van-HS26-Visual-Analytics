@@ -37,7 +37,9 @@ Delay carries along a route, and how much each leg carries is fitted from the da
 
     delay_out = a * delay_in + b
 
-`a` averages 0.909 and tracks the slack in the timetable: a leg booked two minutes keeps 0.967
+Held out on February after fitting on September to January, the per leg model predicts the
+next stop to within 22.2 seconds, against 43.4 for assuming the delay is unchanged and 41.9
+for one global coefficient. `a` averages 0.909 and tracks the slack in the timetable: a leg booked two minutes keeps 0.967
 of whatever arrives, one booked ten keeps 0.755. 30% of legs shed delay, 67% hold it, 3%
 amplify it. Fitting per leg halves the one-step error against assuming the delay is unchanged,
 43.2s to 20.6s over 11.3M legs.
@@ -140,7 +142,8 @@ src/propagation.py the fitted delay propagation model. no interface code
 src/app.py         the Panel interface
 src/style.py       shared figure styling
 notebooks/         exploration, a check that the ranking works, the layout sketch,
-                   and 04_method.ipynb, the statistics behind the scoring
+                   04_method.ipynb on the statistics, 05_model_quality.ipynb on what
+                   the model can and cannot do
 tests/             the SQL and pandas scoring paths must agree
 evaluation/        tasks, consent, questionnaire, anonymised answers, analysis
 figures/           before/ and after/ the user study
