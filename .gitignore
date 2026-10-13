@@ -6,3 +6,4 @@ __pycache__/
 .duckdb_tmp/
 map_test.html
 PLAN.md
+incident_log.jsonl

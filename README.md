@@ -31,7 +31,27 @@ stations every morning and misses the incidents. What matters is late compared t
 normally does at that hour of that weekday, and computing that for every line, station and hour
 is the part the algorithm does.
 
-## What the algorithm does
+## The model
+
+Delay carries along a route, and how much each leg carries is fitted from the data:
+
+    delay_out = a * delay_in + b
+
+`a` averages 0.909 and tracks the slack in the timetable: a leg booked two minutes keeps 0.967
+of whatever arrives, one booked ten keeps 0.755. 30% of legs shed delay, 67% hold it, 3%
+amplify it. Fitting per leg halves the one-step error against assuming the delay is unchanged,
+43.2s to 20.6s over 11.3M legs.
+
+Applied along a route the coefficients compound, so a starting delay becomes a prediction of how
+far it reaches, and the variance compounds with it. The interval widens at every stop, which is
+the honest picture: five stops out is worth less than one stop out.
+
+`prepare.py` stores sufficient statistics per leg rather than coefficients. A least squares fit
+needs only n and five sums, and those are additive, so pooling to line level or to one global
+coefficient is adding rows up. That is why every model parameter refits the model in under a
+tenth of a second instead of filtering its output.
+
+## Finding the episodes worth asking about
 
 1. **Aggregate** to (line, station, hour), keeping three measurements that turn out to be almost
    uncorrelated: the delay **level** on arrival, the **gain** since the previous stop, and the
@@ -63,9 +83,11 @@ line, canton. Parameters change how it is scored: z threshold, minimum excess, m
 arrivals, share measured, cancellation weight, cancellation cost in headways, baseline window,
 and which ranking to order by.
 
-The person then confirms, rejects or annotates each proposed episode. Confirmations go to an
-incident log, rejections suppress similar cells. That log is what makes this a loop rather than a
-report generator.
+The person then judges whether the model got it right and writes a note. The judgement is
+appended to `data/incident_log.jsonl` together with what the model predicted, what actually
+happened, and the settings in force at the time, because a verdict means nothing without the
+model that produced it. Episodes already judged are marked in the table. That record is what
+makes this a loop rather than a report generator.
 
 ## Two things in the data worth knowing
 

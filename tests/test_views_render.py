@@ -136,7 +136,7 @@ def test_hover_fields_all_exist(explorer, selected) -> None:
 def test_the_detail_column_has_the_four_panels(explorer) -> None:
     explorer.table.selection = [0]
     kinds = [type(o).__name__ for o in explorer.detail]
-    assert len(explorer.detail) == 3, f"expected header, forecast and the strip, got {kinds}"
+    assert len(explorer.detail) == 4, f"expected header, forecast, judgement, strip: {kinds}"
 
 
 def test_the_whole_page_builds(explorer) -> None:

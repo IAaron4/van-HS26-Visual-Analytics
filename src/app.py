@@ -22,6 +22,7 @@ from bokeh.models import HoverTool
 from holoviews import opts
 from holoviews.util.transform import lon_lat_to_easting_northing
 
+import incidents
 import model
 import propagation as prop
 import style
@@ -34,6 +35,7 @@ CELLS = PROCESSED / "cells.parquet"
 STATIONS = PROCESSED / "stations.parquet"
 STOP_ORDER = PROCESSED / "stop_order.parquet"
 LEGS = PROCESSED / "legs.parquet"
+INCIDENT_LOG = Path(__file__).resolve().parents[1] / "data" / "incident_log.jsonl"
 
 
 def condition_for(when: pd.Timestamp) -> str:
@@ -90,7 +92,7 @@ MIN_SPAN_M = 90_000.0
 
 TABLE_COLUMNS = [
     "line", "route", "start", "hours", "stations", "severity_h",
-    "score", "worst_min", "started_at", "gain_min", "measured", "share",
+    "score", "worst_min", "started_at", "gain_min", "measured", "share", "judged",
 ]
 
 
@@ -155,6 +157,8 @@ class Explorer(param.Parameterized):
         self._legs = self._con.execute(f"SELECT * FROM read_parquet('{LEGS}')").df()
         self._coef_key: tuple | None = None
         self._coef: pd.DataFrame | None = None
+        self._verdicts = incidents.latest_verdicts(INCIDENT_LOG)
+        self._last_prediction: dict[str, float | None] = {}
 
         # Everything refresh() touches has to exist first: _build_filters sets `categories`,
         # which fires the watcher.
@@ -329,6 +333,10 @@ class Explorer(param.Parameterized):
             share=lambda d: d["share_real"].round(2),
             start=lambda d: d["start"].dt.strftime("%d %b %H:%M"),
         )
+        self._shown["judged"] = [
+            self._verdicts.get(incidents.key_of(r.line, str(r.day), str(r.peak_hour)), "")
+            for r in self._shown.itertuples(index=False)
+        ]
         self.table.value = self._shown[TABLE_COLUMNS]
         self.table.selection = [0]
         self._draw_detail()
@@ -377,6 +385,7 @@ class Explorer(param.Parameterized):
         self.detail[:] = [
             header,
             self._forecast(cells, line, row),
+            self._judgement(row),
             pn.Row(
                 pn.Column("**Episodes on this line that day**", self._episode_strip(cells, line)),
                 pn.Column("**Along the route, hour by hour**", self._heatmap(cells, line)),
@@ -384,6 +393,48 @@ class Explorer(param.Parameterized):
                 height=420, sizing_mode="stretch_width",
             ),
         ]
+
+    def _judgement(self, row: pd.Series) -> pn.viewable.Viewable:
+        """Record what the analyst concluded, with the settings that produced it.
+
+        This is the loop closing. The algorithm proposes an episode and a prediction, the person
+        decides whether it held, and the decision is kept with the model that produced it so it
+        can be read back in context later.
+        """
+        key = incidents.key_of(row["line"], str(row["day"]), str(row["peak_hour"]))
+        already = self._verdicts.get(key)
+
+        verdict = pn.widgets.RadioButtonGroup(
+            options=list(incidents.VERDICTS),
+            value=already or incidents.VERDICTS[0],
+            button_type="default", sizing_mode="stretch_width",
+        )
+        note = pn.widgets.TextInput(placeholder="what happened, if you know", name="")
+        save = pn.widgets.Button(name="Record", button_type="primary", width=110)
+        said = pn.pane.Markdown(
+            f"Last recorded: **{already}**" if already else "Not judged yet.",
+            styles={"font-size": "0.82em", "color": style.INK_SOFT},
+        )
+
+        def record(_event) -> None:
+            incidents.append(INCIDENT_LOG, incidents.Entry(
+                line=row["line"], day=str(row["day"]), episode_start=str(row["peak_hour"]),
+                started_at=str(row["started_at"]), verdict=verdict.value, note=note.value,
+                predicted_end_min=self._last_prediction.get("predicted"),
+                actual_end_min=self._last_prediction.get("actual"),
+                pooling=self.pooling, min_obs=self.min_obs, conditioned=self.conditioned,
+            ))
+            self._verdicts = incidents.latest_verdicts(INCIDENT_LOG)
+            said.object = f"Recorded **{verdict.value}** just now."
+            note.value = ""
+
+        save.on_click(record)
+        return pn.Column(
+            pn.pane.Markdown("**Did the model get it right?**"),
+            verdict,
+            pn.Row(note, save, sizing_mode="stretch_width"),
+            said,
+        )
 
     def _episode_strip(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
         """The anomaly detector, kept as one of the three panels under the forecast.
@@ -493,6 +544,12 @@ class Explorer(param.Parameterized):
             title=f"{line} from {origin}, starting from {source}",
             legend_position="top_left",
         )
+        tail = predicted.iloc[-1]
+        self._last_prediction = {
+            "predicted": round(float(tail["delay_min"]), 2),
+            "actual": (None if pd.isna(tail["actual_min"])
+                       else round(float(tail["actual_min"]), 2)),
+        }
         caption = pn.pane.Markdown(
             f"Solid is what the model expects, dashed is what happened at "
             f"{peak_hour:%H:%M}. The band is {self.interval_sigma:.2f} sigma and widens with "
@@ -544,6 +601,13 @@ class Explorer(param.Parameterized):
             cancelled=("n_cancelled", "sum"), excess_min=("excess_min", "max"),
         )
         grid["value"] = grid["value"].round(1)
+
+        # Cells resting on thin or mostly estimated evidence are faded rather than dropped.
+        # Hiding them would quietly claim the hour was fine when nothing was measured in it.
+        share = (grid["measured"] / grid["trips"].replace(0, float("nan"))).fillna(0.0)
+        enough = (grid["measured"] >= self.min_measured) & (share >= self.min_share_real)
+        grid["evidence"] = enough.map({True: 1.0, False: 0.35})
+        grid["share_measured"] = share.round(2)
         rows = grid.sort_values("position", ascending=False)["row"].drop_duplicates().tolist()
 
         hover = HoverTool(tooltips=[
@@ -552,16 +616,19 @@ class Explorer(param.Parameterized):
             ("minutes", "@value{0.0}"),
             ("above normal", "@excess_min{0.0} min"),
             ("trains", "@measured of @trips measured, @cancelled cancelled"),
+            ("faded means", "thin evidence, @share_measured measured"),
         ])
         heat = hv.HeatMap(
             grid,
             kdims=[hv.Dimension("hour_of_day", label="hour of day"),
                    hv.Dimension("row", label=row_label, values=rows)],
-            vdims=["value", "excess_min", "trips", "measured", "cancelled"],
+            vdims=["value", "excess_min", "trips", "measured", "cancelled",
+                   "evidence", "share_measured"],
         ).opts(
             opts.HeatMap(
                 cmap="Blues" if level else "RdBu_r",
                 clim=(0, 15) if level else (-10, 10),
+                alpha=hv.dim("evidence"),
                 colorbar=True, tools=[hover], height=400, responsive=True,
                 title="minutes late" if level else "minutes added since the previous stop",
                 fontscale=0.75, xticks=list(range(0, 24, 3)), toolbar="above",
