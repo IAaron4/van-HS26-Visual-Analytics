@@ -174,6 +174,77 @@ def build_cube(con: duckdb.DuckDBPyConnection, stops_glob: str, target: Path) ->
 
 BASELINE_WINDOWS = (4, 8, 12)
 
+# When a leg is fitted. Weekends have no commuter peak, so they are one bucket rather than two,
+# and the small hours are their own because almost nothing runs and what does runs differently.
+CONDITION_SQL = """
+    CASE
+        WHEN date_part('hour', a.arr_sched) < 5 OR date_part('hour', a.arr_sched) >= 22
+            THEN 'night'
+        WHEN date_part('dow', a.arr_sched) IN (0, 6) THEN 'weekend'
+        WHEN date_part('hour', a.arr_sched) BETWEEN 6 AND 8
+          OR date_part('hour', a.arr_sched) BETWEEN 16 AND 18 THEN 'weekday peak'
+        ELSE 'weekday off peak'
+    END
+"""
+
+
+def build_legs(con: duckdb.DuckDBPyConnection, stops_glob: str, target: Path) -> None:
+    """Sufficient statistics for fitting delay_out = a * delay_in + b on each leg.
+
+    A least squares fit needs only n and five sums, and those are additive. Storing them per leg
+    means the app can pool to line level or to one global coefficient by adding rows up, rather
+    than refitting eleven million legs whenever a parameter moves. That is what lets the model
+    parameters actually recompute the model instead of filtering its output.
+
+    A leg is one trip's arrival at a stop and its arrival at the next. Only measured, uncancelled
+    arrivals count, and the booked running time has to be sane, because a leg of several hours is
+    a trip boundary rather than a leg.
+    """
+    con.execute(
+        f"""
+        COPY (
+            WITH seq AS (
+                SELECT trip_id, service_day, line, bpuic, station, arr_sched, arr_delay_s,
+                       row_number() OVER (
+                           PARTITION BY trip_id, service_day ORDER BY arr_sched
+                       ) AS pos
+                FROM read_parquet('{stops_glob}')
+                WHERE arr_measured AND NOT cancelled AND arr_sched IS NOT NULL
+                  AND line IS NOT NULL AND {SWISS}
+            ),
+            leg AS (
+                SELECT a.line,
+                       a.bpuic   AS from_stop,
+                       b.bpuic   AS to_stop,
+                       a.station AS from_name,
+                       b.station AS to_name,
+                       {CONDITION_SQL} AS condition,
+                       a.arr_delay_s::DOUBLE AS x,
+                       b.arr_delay_s::DOUBLE AS y,
+                       date_diff('minute', a.arr_sched, b.arr_sched) AS booked_min
+                FROM seq a
+                JOIN seq b
+                  ON a.trip_id = b.trip_id
+                 AND a.service_day = b.service_day
+                 AND b.pos = a.pos + 1
+                WHERE date_diff('minute', a.arr_sched, b.arr_sched) BETWEEN 1 AND 60
+            )
+            SELECT line, from_stop, to_stop, condition,
+                   any_value(from_name)        AS from_name,
+                   any_value(to_name)          AS to_name,
+                   count(*)                    AS n,
+                   sum(x)                      AS sx,
+                   sum(y)                      AS sy,
+                   sum(x * y)                  AS sxy,
+                   sum(x * x)                  AS sxx,
+                   sum(y * y)                  AS syy,
+                   median(booked_min)          AS booked_min
+            FROM leg
+            GROUP BY line, from_stop, to_stop, condition
+        ) TO '{target}' (FORMAT parquet, COMPRESSION zstd)
+        """
+    )
+
 
 def build_cells(con: duckdb.DuckDBPyConnection, cube: Path, target: Path) -> None:
     """The cube plus a rolling baseline per hour-of-week slot, for three window lengths.
@@ -412,6 +483,7 @@ def main() -> int:
     build_cube(con, stops_glob, PROCESSED / "cube.parquet")
     build_cells(con, PROCESSED / "cube.parquet", PROCESSED / "cells.parquet")
     build_stop_order(con, stops_glob, PROCESSED / "stop_order.parquet")
+    build_legs(con, stops_glob, PROCESSED / "legs.parquet")
     report(con, stops_glob, points)
     print(f"\ncube written to {PROCESSED / 'cube.parquet'}")
     return 0

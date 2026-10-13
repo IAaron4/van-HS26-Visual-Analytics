@@ -111,8 +111,10 @@ Raw and processed data are not committed. Both scripts rebuild them.
 
 ```
 src/fetch.py       download the monthly archives
-src/prepare.py     archives to parquet, then the hourly cube, baselines and stop order
+src/prepare.py     archives to parquet, then the hourly cube, baselines, stop order
+                   and the per-leg statistics the propagation model is fitted from
 src/model.py       baseline, scoring, episode grouping. no interface code
+src/propagation.py the fitted delay propagation model. no interface code
 src/app.py         the Panel interface
 src/style.py       shared figure styling
 notebooks/         exploration, a check that the ranking works, the layout sketch,

@@ -103,6 +103,21 @@ def add_baseline(cells: pd.DataFrame, params: Params = Params()) -> pd.DataFrame
     return out
 
 
+def add_baseline_columns(cells: pd.DataFrame, params: Params = Params()) -> pd.DataFrame:
+    """Baseline for a frame that already carries one window as base_delay_s and friends.
+
+    The app picks a window when it loads a scenario, so by the time a frame reaches here the
+    week suffix is gone. Same rule as add_baseline: too few past observations means no baseline
+    rather than a guess.
+    """
+    out = prepare_cells(cells)
+    enough = out["base_n"] >= params.min_baseline_obs
+    out["baseline_delay_s"] = out["base_delay_s"].where(enough)
+    out["baseline_iqr_s"] = out["base_iqr_s"].where(enough)
+    out["baseline_n"] = out["base_n"]
+    return out
+
+
 def score_cells(cells: pd.DataFrame, params: Params = Params()) -> pd.DataFrame:
     """Robust z-score against the baseline, plus the cancellation term.
 

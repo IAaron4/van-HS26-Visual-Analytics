@@ -8,6 +8,7 @@ map, and the episode hour by hour.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ import holoviews as hv
 import pandas as pd
 import panel as pn
 import param
+from bokeh.models import HoverTool
 from holoviews import opts
 from holoviews.util.transform import lon_lat_to_easting_northing
 
@@ -46,6 +48,31 @@ CATEGORY_NAMES = {
     "TGV": "TGV", "NJ": "Nightjet", "TER": "TER", "RB": "RegionalBahn",
 }
 NAMED_GROUPS = 6
+
+# An optional override. Set VAN_TILE_URL to a full {Z}/{X}/{Y} template to use a provider that
+# wants a key. It is read from the environment so the key never reaches the repository.
+
+TILE_URL = os.environ.get("VAN_TILE_URL")
+
+# Keyless basemaps, so the map works with no account anywhere. OpenStreetMap is the default
+# because it is unmistakably a map: its tiles carry about 47 kB of detail where CARTO's pale
+# style carries 2 kB, which is easy to mistake for nothing having loaded. If a provider blocks
+# you, switch here rather than hunting for a key.
+BASEMAPS = {
+    "OpenStreetMap": "OSM",
+    "Esri streets": "EsriStreet",
+    "Esri terrain": "EsriTerrain",
+    "OpenTopoMap": "OpenTopoMap",
+    "Carto light (very pale)": "CartoLight",
+}
+
+# Roughly the country, in degrees, for the view that shows where a line sits in Switzerland.
+SWISS_BOUNDS_DEG = (5.8, 45.7, 10.6, 47.9)
+
+# Smallest span the fitted view is allowed to have, in Web Mercator metres. A short line like
+# Ponte Tresa to Lugano covers five kilometres, and fitting the view to it leaves a suburb with
+# nothing recognisable in it. Keeping a floor means there is always some geography around it.
+MIN_SPAN_M = 90_000.0
 
 TABLE_COLUMNS = [
     "line", "route", "start", "hours", "stations", "severity_h",
@@ -77,6 +104,18 @@ class Explorer(param.Parameterized):
     colour_by = param.Selector(
         objects={"how late it was": "level", "where it was added": "gain"}, default="level"
     )
+    rows_by = param.Selector(
+        objects={
+            "stations that were flagged": "flagged",
+            "every station on the line": "all",
+            "cantons": "canton",
+        },
+        default="flagged",
+    )
+    map_extent = param.Selector(
+        objects={"around the line": "line", "all of Switzerland": "country"}, default="line"
+    )
+    basemap = param.Selector(objects=list(BASEMAPS), default="OpenStreetMap")
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -103,8 +142,9 @@ class Explorer(param.Parameterized):
         self.n_flagged = 0
 
         self.table = pn.widgets.Tabulator(
-            pd.DataFrame(columns=TABLE_COLUMNS), height=300, disabled=True,
+            pd.DataFrame(columns=TABLE_COLUMNS), height=235, disabled=True,
             show_index=False, selectable=1, theme="simple",
+            pagination="local", page_size=6,
         )
         self.table.param.watch(lambda _: self._draw_detail(), "selection")
         self.detail = pn.Column(sizing_mode="stretch_width")
@@ -248,7 +288,7 @@ class Explorer(param.Parameterized):
             self.detail[:] = [pn.pane.Markdown("Nothing flagged. Try a lower threshold.")]
             return
 
-        self._shown = found.head(200).assign(
+        self._shown = found.head(60).assign(
             route=lambda d: d["line"].map(self._routes).fillna(""),
             day=lambda d: d["start"].dt.date,
             hours=lambda d: ((d["end"] - d["start"]).dt.total_seconds() / 3600 + 1).astype(int),
@@ -266,7 +306,7 @@ class Explorer(param.Parameterized):
         self.table.selection = [0]
         self._draw_detail()
 
-    @param.depends("colour_by", watch=True)
+    @param.depends("colour_by", "rows_by", "map_extent", "basemap", watch=True)
     def _recolour(self) -> None:
         self._draw_detail()
 
@@ -278,8 +318,9 @@ class Explorer(param.Parameterized):
 
         cells = self._con.execute(
             """
-            SELECT station, bpuic, hour, median_delay_s, median_gain_s,
-                   n_trips, n_measured, n_cancelled, lat, lon
+            SELECT station, bpuic, hour, canton, median_delay_s, median_gain_s,
+                   n_trips, n_measured, n_cancelled, lat, lon,
+                   base_delay_s, base_iqr_s, base_n
             FROM slice WHERE line = ? AND hour::DATE = ?
             """,
             [line, day],
@@ -287,6 +328,15 @@ class Explorer(param.Parameterized):
         if cells.empty:
             self.detail[:] = [pn.pane.Markdown("No cells for that line and day.")]
             return
+
+        # Which cells the gates actually flagged, so the heatmap can show only those rows and
+        # the tooltip can say how far above normal each one was.
+        scored = model.score_cells(model.add_baseline_columns(cells), self.params)
+        cells = cells.assign(
+            excess_min=(scored["excess_s"] / 60).round(1),
+            score=scored["score"].round(1),
+            flagged=model.worth_reporting(scored, self.params),
+        )
 
         header = pn.pane.Markdown(
             f"### {line} &nbsp;·&nbsp; {self._routes.get(line, 'route unknown')}"
@@ -302,7 +352,17 @@ class Explorer(param.Parameterized):
         ]
 
     def _heatmap(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
-        """The route against the hour, coloured by whichever measure is selected."""
+        """The route against the hour, coloured by whichever measure is selected.
+
+        A long line has sixty or more stops, which makes an unreadable axis, so the rows are
+        whatever `rows_by` asks for: only the stations the gates flagged, every station, or
+        rolled up to cantons. Cantons lose the route order, which is the point of the view, so
+        they are an option rather than the default.
+
+        Rows are aggregated in pandas first. Handing HeatMap duplicate (hour, station) pairs,
+        which happens when two stop ids share a name, makes it aggregate silently and drop the
+        value columns, and the tooltip then shows ??? instead of numbers.
+        """
         level = self.colour_by == "level"
         field = "median_delay_s" if level else "median_gain_s"
         order = self._stop_order[self._stop_order["line"] == line]
@@ -312,25 +372,48 @@ class Explorer(param.Parameterized):
             hour_of_day=cells["hour"].dt.hour,
             value=(cells[field] / 60).round(2),
             position=cells["station"].map(pos),
-        ).dropna(subset=["position", "value"])
+        ).dropna(subset=["value"])
+
+        row_label = "canton" if self.rows_by == "canton" else "station"
+        if self.rows_by == "canton":
+            frame = frame.assign(row=frame["canton"].fillna("unknown"))
+            frame["position"] = frame.groupby("row")["position"].transform("median")
+        else:
+            if self.rows_by == "flagged" and frame["flagged"].any():
+                keep = set(frame.loc[frame["flagged"], "station"])
+                frame = frame[frame["station"].isin(keep)]
+            frame = frame.assign(row=frame["station"])
+        frame = frame.dropna(subset=["position"])
         if frame.empty:
             return pn.pane.Markdown("Nothing to draw for this measure.")
-        stations = (
-            frame.sort_values("position", ascending=False)["station"].drop_duplicates().tolist()
-        )
 
+        grid = frame.groupby(["row", "hour_of_day"], as_index=False).agg(
+            value=("value", "median"), position=("position", "first"),
+            trips=("n_trips", "sum"), measured=("n_measured", "sum"),
+            cancelled=("n_cancelled", "sum"), excess_min=("excess_min", "max"),
+        )
+        grid["value"] = grid["value"].round(1)
+        rows = grid.sort_values("position", ascending=False)["row"].drop_duplicates().tolist()
+
+        hover = HoverTool(tooltips=[
+            ("", "@row"),
+            ("hour", "@hour_of_day{0}:00"),
+            ("minutes", "@value{0.0}"),
+            ("above normal", "@excess_min{0.0} min"),
+            ("trains", "@measured of @trips measured, @cancelled cancelled"),
+        ])
         heat = hv.HeatMap(
-            frame,
+            grid,
             kdims=[hv.Dimension("hour_of_day", label="hour of day"),
-                   hv.Dimension("station", values=stations)],
-            vdims=["value", "n_measured", "n_cancelled"],
+                   hv.Dimension("row", label=row_label, values=rows)],
+            vdims=["value", "excess_min", "trips", "measured", "cancelled"],
         ).opts(
             opts.HeatMap(
                 cmap="Blues" if level else "RdBu_r",
                 clim=(0, 15) if level else (-10, 10),
-                colorbar=True, tools=["hover"], height=400, responsive=True,
+                colorbar=True, tools=[hover], height=400, responsive=True,
                 title="minutes late" if level else "minutes added since the previous stop",
-                fontscale=0.8,
+                fontscale=0.75, xticks=list(range(0, 24, 3)), toolbar="above",
             )
         )
         return pn.pane.HoloViews(heat, sizing_mode="stretch_width")
@@ -354,17 +437,44 @@ class Explorer(param.Parameterized):
         route = hv.Path([worst[["x", "y"]].to_numpy()]).opts(
             color=style.INK_SOFT, line_width=2, alpha=0.45
         )
+        hover = HoverTool(tooltips=[("", "@station"), ("worst hour", "@worst_min{0.0} min late")])
         stops = hv.Points(worst, ["x", "y"], ["station", "worst_min"]).opts(
-            color="worst_min", cmap="Blues", clim=(0, 15), size=9, tools=["hover"],
+            color="worst_min", cmap="Blues", clim=(0, 15), size=9, tools=[hover],
             line_color="#444444", line_width=0.8, colorbar=False,
         )
-        tiles = hv.element.tiles.CartoLight().opts(alpha=0.7)
+        # Full opacity. Dimming a basemap that is already nearly white left nothing to see.
+        if TILE_URL:
+            tiles = hv.Tiles(TILE_URL)
+        else:
+            tiles = getattr(hv.element.tiles, BASEMAPS[self.basemap])()
+        xlim, ylim = self._map_bounds(worst)
         return pn.pane.HoloViews(
             (tiles * route * stops).opts(
-                height=400, responsive=True, title=f"{line}: every stop", fontscale=0.8
+                height=400, responsive=True, fontscale=0.8, xaxis=None, yaxis=None,
+                xlim=xlim, ylim=ylim, title=f"{line}: every stop",
             ),
             sizing_mode="stretch_width",
         )
+
+    def _map_bounds(self, stops: pd.DataFrame) -> tuple[tuple, tuple]:
+        """The view the map opens on, in Web Mercator metres.
+
+        Fitting tightly to a five kilometre line gives a suburb with no landmarks in it, so the
+        fitted view has a floor on its span and some padding. The country view is there for
+        when the question is where in Switzerland this is rather than which stops are involved.
+        """
+        if self.map_extent == "country":
+            west, south, east, north = SWISS_BOUNDS_DEG
+            x, y = lon_lat_to_easting_northing([west, east], [south, north])
+            return (x[0], x[1]), (y[0], y[1])
+
+        cx, cy = stops["x"].mean(), stops["y"].mean()
+        span = max(
+            stops["x"].max() - stops["x"].min(),
+            stops["y"].max() - stops["y"].min(),
+            MIN_SPAN_M,
+        ) * 1.25
+        return (cx - span / 2, cx + span / 2), (cy - span / 2, cy + span / 2)
 
     def _profile(self, cells: pd.DataFrame) -> pn.viewable.Viewable:
         """The line hour by hour: how late, how much cancelled, how much was measured.
@@ -381,18 +491,38 @@ class Explorer(param.Parameterized):
         )
         hourly["cancelled_pct"] = (
             100 * hourly["cancelled"] / hourly["trips"].replace(0, float("nan"))
-        ).fillna(0)
+        ).fillna(0).round(1)
+        hourly["delay_min"] = hourly["delay_min"].round(1)
 
-        shared = dict(responsive=True, height=120, tools=["hover"], fontscale=0.8)
+        hover = HoverTool(tooltips=[
+            ("hour", "@hour_of_day{0}:00"),
+            ("median delay", "@delay_min{0.0} min"),
+            ("cancelled", "@cancelled of @trips (@cancelled_pct{0.0}%)"),
+            ("measured", "@measured arrivals"),
+        ])
+        vdims = ["trips", "measured", "cancelled", "cancelled_pct", "delay_min"]
+
+        def band(column: str, label: str, colour: str, ylim=None, last: bool = False):
+            """A filled line with visible markers, because a bare Area will not hover."""
+            area = hv.Area(hourly, "hour_of_day", column).opts(
+                color=colour, alpha=0.18, line_alpha=0)
+            line = hv.Curve(hourly, "hour_of_day", column).opts(color=colour, line_width=2)
+            dots = hv.Scatter(hourly, "hour_of_day", [column, *vdims]).opts(
+                color=colour, size=5, tools=[hover], line_color=style.SURFACE, line_width=1)
+            # ylim is only passed when there is one. HoloViews rejects None, and it does so at
+            # render time rather than when the object is built.
+            limit = {"ylim": ylim} if ylim is not None else {}
+            return (area * line * dots).opts(
+                responsive=True, height=135, ylabel=label, fontscale=0.75,
+                xlabel="hour of day" if last else "", xticks=list(range(0, 24, 3)),
+                show_grid=True, gridstyle={"grid_line_alpha": 0.25},
+                toolbar=None, default_tools=[], **limit,
+            )
+
         panels = (
-            hv.Curve(hourly, "hour_of_day", "delay_min").opts(
-                color=style.SERIES[0], line_width=2, ylabel="delay (min)", **shared)
-            + hv.Area(hourly, "hour_of_day", "cancelled_pct").opts(
-                color=style.SERIES[1], alpha=0.45, ylabel="cancelled (%)",
-                ylim=(0, 100), **shared)
-            + hv.Area(hourly, "hour_of_day", "measured").opts(
-                color=style.INK_SOFT, alpha=0.25, ylabel="measured",
-                xlabel="hour of day", **shared)
+            band("delay_min", "delay (min)", style.SERIES[0])
+            + band("cancelled_pct", "cancelled (%)", style.SERIES[1], ylim=(0, 100))
+            + band("measured", "measured", style.INK_SOFT, last=True)
         )
         return pn.pane.HoloViews(panels.cols(1), sizing_mode="stretch_width")
 
@@ -431,8 +561,13 @@ def layout() -> pn.viewable.Viewable:
         explorer.param.cancel_headway_multiple,
         explorer.param.baseline_weeks,
         pn.layout.Divider(),
-        "### Heatmap shows",
+        "### Heatmap",
         explorer.param.colour_by,
+        explorer.param.rows_by,
+        pn.layout.Divider(),
+        "### Map",
+        explorer.param.map_extent,
+        explorer.param.basemap,
         width=250,
     )
     return pn.template.FastListTemplate(
