@@ -145,7 +145,7 @@ notebooks/         exploration, a check that the ranking works, the layout sketc
                    04_method.ipynb on the statistics, 05_model_quality.ipynb on what
                    the model can and cannot do
 tests/             the SQL and pandas scoring paths must agree
-evaluation/        tasks, consent, questionnaire, anonymised answers, analysis
+evaluation/        protocol, consent, questionnaire. Answers and analysis once it is run
 figures/           before/ and after/ the user study
 ```
 
