@@ -125,6 +125,23 @@ def test_a_shedding_route_brings_the_delay_down() -> None:
     assert out["delay_s"].is_monotonic_decreasing
 
 
+def test_a_wider_coverage_asks_for_a_wider_band() -> None:
+    """The control has to mean something: more coverage, more band."""
+    legs, coef = route(4), coefficients(1.0, 20.0, 4)
+    widths = []
+    for coverage in (0.5, 0.8, 0.95):
+        out = prop.predict_route(legs, 300.0, coef, prop.Params(coverage=coverage))
+        widths.append(float(out["upper_s"].iloc[-1] - out["lower_s"].iloc[-1]))
+    assert widths == sorted(widths), f"band did not grow with coverage: {widths}"
+    assert widths[-1] > 4 * widths[0], "95% should be far wider, the tails are heavy"
+
+
+def test_the_calibration_is_not_the_normal_distribution() -> None:
+    """If these ever match the textbook values, someone has undone the calibration."""
+    assert prop.COVERAGE_MULTIPLIER[0.95] > 5, "95% needs about ten sigma here, not two"
+    assert prop.COVERAGE_MULTIPLIER[0.5] < 1.5
+
+
 def test_the_interval_widens_with_every_leg() -> None:
     out = prop.predict_route(route(5), 300.0, coefficients(1.0, 20.0, 5))
     width = out["upper_s"] - out["lower_s"]
@@ -144,7 +161,7 @@ def test_an_empty_route_is_not_an_error() -> None:
     assert prop.predict_route(pd.DataFrame(), 300.0, coefficients(1.0, 1.0, 2)).empty
 
 
-@pytest.mark.parametrize("bad", [{"pooling": "vibes"}, {"min_obs": 2}])
+@pytest.mark.parametrize("bad", [{"pooling": "vibes"}, {"min_obs": 2}, {"coverage": 0.77}])
 def test_nonsense_parameters_are_refused(bad: dict) -> None:
     with pytest.raises(ValueError):
         prop.Params(**bad)

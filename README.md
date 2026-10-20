@@ -48,6 +48,11 @@ Applied along a route the coefficients compound, so a starting delay becomes a p
 far it reaches, and the variance compounds with it. The interval widens at every stop, which is
 the honest picture: five stops out is worth less than one stop out.
 
+The band is calibrated against measured residuals rather than the normal distribution,
+because the residuals are nowhere near normal: a true 95% needs about ten sigma, 21% of
+stops land beyond three sigma where a normal says 0.3%, and the worst is 52. So the control
+asks how often the band should hold rather than for a sigma count.
+
 `prepare.py` stores sufficient statistics per leg rather than coefficients. A least squares fit
 needs only n and five sums, and those are additive, so pooling to line level or to one global
 coefficient is adding rows up. That is why every model parameter refits the model in under a
@@ -83,7 +88,8 @@ cost marks rather than earn them.
 Filters narrow which data is in play: scenario (winter or summer), date range, train category,
 line, canton. Parameters change how it is scored: z threshold, minimum excess, minimum measured
 arrivals, share measured, cancellation weight, cancellation cost in headways, baseline window,
-and which ranking to order by.
+and which ranking to order by. For the model: pooling level, minimum observations,
+conditioning, how often the band should hold, and the starting delay.
 
 The person then judges whether the model got it right and writes a note. The judgement is
 appended to `data/incident_log.jsonl` together with what the model predicted, what actually

@@ -137,7 +137,11 @@ class Explorer(param.Parameterized):
     pooling = param.Selector(objects=list(prop.POOLING), default="leg")
     min_obs = param.Integer(60, bounds=(5, 2000), step=5)
     conditioned = param.Boolean(True)
-    interval_sigma = param.Number(1.96, bounds=(0.5, 3.0), step=0.25)
+    coverage = param.Selector(
+        objects={"half the days": 0.5, "4 days in 5": 0.8, "9 days in 10": 0.9,
+                 "19 days in 20": 0.95},
+        default=0.8,
+    )
     start_from_actual = param.Boolean(True)
     start_delay_min = param.Number(5.0, bounds=(0.0, 30.0), step=0.5)
 
@@ -342,7 +346,7 @@ class Explorer(param.Parameterized):
         self._draw_detail()
 
     @param.depends("colour_by", "rows_by", "map_extent", "basemap", "pooling", "min_obs",
-                   "conditioned", "interval_sigma", "start_from_actual", "start_delay_min",
+                   "conditioned", "coverage", "start_from_actual", "start_delay_min",
                    watch=True)
     def _recolour(self) -> None:
         self._draw_detail()
@@ -454,7 +458,7 @@ class Explorer(param.Parameterized):
     def model_params(self) -> prop.Params:
         return prop.Params(
             pooling=self.pooling, min_obs=self.min_obs,
-            conditioned=self.conditioned, interval_sigma=self.interval_sigma,
+            conditioned=self.conditioned, coverage=self.coverage,
         )
 
     def coefficients(self) -> pd.DataFrame:
@@ -563,7 +567,8 @@ class Explorer(param.Parameterized):
         caption = pn.pane.Markdown(
             f"Dotted is what this route normally runs at, solid is what the model expects "
             f"given the start, dashed is what happened at {peak_hour:%H:%M}. The band is "
-            f"{self.interval_sigma:.2f} sigma and widens with every leg, so where it "
+            f"wide enough to hold the truth {100 * self.coverage:.0f}% of the time, and widens "
+            f"with every leg, so where it "
             f"swallows the dashed line the model has run out of things to say.",
             styles={"font-size": "0.82em", "color": style.INK_SOFT},
         )
@@ -784,7 +789,7 @@ def layout() -> pn.viewable.Viewable:
         explorer.param.pooling,
         explorer.param.min_obs,
         explorer.param.conditioned,
-        explorer.param.interval_sigma,
+        explorer.param.coverage,
         explorer.param.start_from_actual,
         explorer.param.start_delay_min,
         pn.layout.Divider(),

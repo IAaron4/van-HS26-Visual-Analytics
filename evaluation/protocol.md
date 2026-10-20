@@ -84,13 +84,19 @@ every stop rests on thin evidence but the prediction happens to be close, so the
 
 ## Why the band is worth probing
 
-Measured across 46 episodes, the 1.96 sigma band covers **72%** of stops, where an honest
-interval would cover about 95%. The model is overconfident, because the variance propagation
-treats each leg's error as independent when a bad day is bad at every stop.
+The band used to claim 95% and deliver 72%, because the variance propagation treats each
+leg's error as independent when a bad day is bad at every stop. It is now calibrated against
+1136 measured stops instead of the normal distribution, and the control asks for a coverage
+level rather than a sigma count.
 
-I would rather report that than quietly widen the band. It also means task 3 is not a contrived
-trap: the tool really does present confident predictions that are wrong, and finding out whether
-people notice is exactly what the evaluation is for.
+The calibration exposed something worth saying in the report: reaching a true 95% takes about
+ten sigma, not two. 21% of stops land beyond 3 sigma where a normal distribution says 0.3%, and
+the worst is 52 sigma. Delay is event driven, so most stops sit close to the fit and a few are
+thrown a very long way by something the model cannot see.
+
+Task 3 still works, and now it tests a correct design rather than a broken one. At the default
+of 4 days in 5 the R55 band is honest and the prediction is still wrong, so the question becomes
+whether people read the band at all.
 
 ## Measures
 

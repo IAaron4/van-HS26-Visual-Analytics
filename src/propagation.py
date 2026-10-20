@@ -26,6 +26,18 @@ STAT_COLUMNS = ["n", "sx", "sy", "sxy", "sxx", "syy"]
 
 POOLING = ("leg", "line", "global")
 
+# How many sigma the band actually needs to reach a given coverage, measured on 1136 predicted
+# stops across both scenarios rather than taken from the normal distribution.
+#
+# The theory says 1.96 sigma covers 95%. Measured, it covers 72%, and reaching a true 95% takes
+# about ten sigma. The residuals are nothing like normal: 21% of stops land beyond 3 sigma where
+# a normal says 0.3%, and the worst is 52 sigma. Delay is event driven, so most stops sit close
+# to the fit and a few are thrown a very long way by something the model cannot see.
+#
+# Fitted on winter and checked on summer, where the same multipliers hold to within a few
+# percent, so these are not tuned to one season.
+COVERAGE_MULTIPLIER = {0.5: 1.1, 0.68: 1.8, 0.8: 3.2, 0.9: 5.2, 0.95: 10.2}
+
 # A fit needs at least this many points before a slope means anything at all, whatever the user
 # asks for.
 ABSOLUTE_MIN_N = 5
@@ -38,13 +50,22 @@ class Params:
     pooling: str = "leg"
     min_obs: int = 60
     conditioned: bool = True
-    interval_sigma: float = 1.96
+    # How often the band should actually contain the truth. Not a sigma count, because the
+    # residuals are too heavy tailed for sigma to mean what it usually means.
+    coverage: float = 0.8
 
     def __post_init__(self) -> None:
         if self.pooling not in POOLING:
             raise ValueError(f"pooling must be one of {POOLING}")
         if self.min_obs < ABSOLUTE_MIN_N:
             raise ValueError(f"min_obs must be at least {ABSOLUTE_MIN_N}")
+        if self.coverage not in COVERAGE_MULTIPLIER:
+            raise ValueError(f"coverage must be one of {tuple(COVERAGE_MULTIPLIER)}")
+
+    @property
+    def band_sigma(self) -> float:
+        """The multiplier that makes the band mean what it claims."""
+        return COVERAGE_MULTIPLIER[self.coverage]
 
 
 def _fit_from_stats(stats: pd.DataFrame) -> pd.DataFrame:
@@ -165,7 +186,7 @@ def predict_route(
 
         delay = a * delay + b
         variance = a * a * variance + (0.0 if np.isnan(sigma) else sigma**2)
-        spread = params.interval_sigma * np.sqrt(variance)
+        spread = params.band_sigma * np.sqrt(variance)
         rows.append({
             "station": leg.to_name, "bpuic": leg.to_stop, "delay_s": delay,
             "lower_s": delay - spread, "upper_s": delay + spread, "a": a, "level": level,
