@@ -83,13 +83,38 @@ on screen, every parameter means something in plain language, and the whole meth
 sentence under questioning. The module grades transparency of the algorithm, so a black box would
 cost marks rather than earn them.
 
+## What is on screen
+
+Controls down the left, everything else in one column:
+
+1. **Filters** across the top: scenario, train category, canton.
+2. **The ranked list** of line-days the scoring flagged. Picking a row drives everything below.
+3. **The forecast**, large: what the model expects along the route from where the delay was
+   added, its calibrated band, what actually happened, and what that route normally runs at.
+4. **Three panels** side by side. The whole day hour by hour, including the cancellation rate,
+   which is the one thing delay alone cannot show. The route against the hour, coloured by how
+   late or by where delay was added. Every stop on the map, coloured by its worst hour.
+5. **The verdict**, last, after the evidence rather than between two halves of it.
+
+Chart widths are fixed rather than fluid. A Bokeh figure set to stretch takes the width of the
+page instead of the column it sits in, so every chart overflowed by the width of the controls.
+Pinning them was the only thing that held, and it makes the report screenshots reproducible.
+
 ## What the user controls
 
-Filters narrow which data is in play: scenario (winter or summer), date range, train category,
-line, canton. Parameters change how it is scored: z threshold, minimum excess, minimum measured
-arrivals, share measured, cancellation weight, cancellation cost in headways, baseline window,
-and which ranking to order by. For the model: pooling level, minimum observations,
-conditioning, how often the band should hold, and the starting delay.
+Filters narrow which data is in play: scenario (winter or summer), train category, canton.
+The rest change how the data is treated, grouped by the question each group answers.
+
+**Which days to look at**: how far from normal, how many minutes late on top of that, how many
+trains were measured and what share of them, how much cancellations count and what a
+cancellation costs in waiting, how many weeks of history define normal, and what to rank by.
+
+**What the model expects**: whether to fit each stop pair, each line or the country, how many
+trains a fit needs before it stops borrowing, whether peak and off peak are fitted apart, how
+often the band should hold, and where the forecast starts.
+
+Every control carries a plain-language label and a one-line explanation on hover, because a
+parameter nobody can name is not a parameter the user steers.
 
 The person then judges whether the model got it right and writes a note. The judgement is
 appended to `data/incident_log.jsonl` together with what the model predicted, what actually
