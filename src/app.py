@@ -80,6 +80,13 @@ CATEGORY_NAMES = {
 }
 NAMED_GROUPS = 6
 
+# Fixed widths rather than responsive ones. A Bokeh figure set to stretch takes the width of
+# the page rather than of the column it sits in, so every chart overflowed by the width of the
+# controls. Pinning them is the only thing that held, and it makes screenshots reproducible.
+CONTROLS_W = 250
+CONTENT_W = 960
+PANEL_W = (235, 400, 305)
+
 # An optional override. Set VAN_TILE_URL to a full {Z}/{X}/{Y} template to use a provider that
 # wants a key. It is read from the environment so the key never reaches the repository.
 
@@ -120,8 +127,8 @@ TABLE_COLUMNS = [
 
 
 def _label(code: str, pct: float) -> str:
-    name = CATEGORY_NAMES.get(code)
-    return f"{name} ({code}) {pct:.0f}%" if name else f"{code} {pct:.0f}%"
+    """Short enough that seven of them fit one row."""
+    return f"{CATEGORY_NAMES.get(code, code)} {pct:.0f}%"
 
 
 class Explorer(param.Parameterized):
@@ -306,7 +313,7 @@ class Explorer(param.Parameterized):
         rest = counts.iloc[NAMED_GROUPS:]
         if len(rest):
             share = 100 * rest["n"].sum() / total
-            label = f"everything else ({len(rest)} kinds) {share:.0f}%"
+            label = f"{len(rest)} other kinds {share:.0f}%"
             self._groups[label] = rest["category"].tolist()
 
         self.param.categories.objects = list(self._groups)
@@ -478,15 +485,7 @@ class Explorer(param.Parameterized):
         self.detail[:] = [
             header,
             self._forecast(cells, line, row),
-            pn.Row(
-                pn.Column("**The whole day, hour by hour**",
-                          self._profile(cells), styles={"flex": "25 1 0"}),
-                pn.Column(f"**Along the route, hour by hour**, {measure}",
-                          self._heatmap(cells, line), styles={"flex": "42 1 0"}),
-                pn.Column("**Every stop, worst of the day**",
-                          self._map(cells, line), styles={"flex": "33 1 0"}),
-                sizing_mode="stretch_width",
-            ),
+            self._panels(cells, line, measure),
             self._judgement(row),
         ]
 
@@ -500,7 +499,8 @@ class Explorer(param.Parameterized):
         key = incidents.key_of(row["line"], str(row["day"]), str(row["peak_hour"]))
         already = self._verdicts.get(key)
 
-        note = pn.widgets.TextInput(placeholder="what happened, if you know", name="", width=360)
+        note = pn.widgets.TextInput(
+            placeholder="what happened, if you know", name="", width=430)
         said = pn.pane.Markdown(
             f"Last recorded: **{already}**" if already else "Not judged yet.",
             styles={"font-size": "0.82em", "color": style.INK_SOFT},
@@ -526,18 +526,32 @@ class Explorer(param.Parameterized):
         buttons = []
         for choice in incidents.VERDICTS:
             button = pn.widgets.Button(
-                name=choice, width=160,
+                name=choice, width=150,
                 button_type="primary" if choice == already else "default",
             )
             button.on_click(record(choice))
             buttons.append(button)
 
         return pn.Column(
-            pn.Row(
-                pn.pane.Markdown("**Did the model get it right?**", width=200),
-                *buttons, note,
-            ),
-            said,
+            pn.Row(pn.pane.Markdown("**Did the model get it right?**", width=200), *buttons),
+            pn.Row(note, said),
+            width=CONTENT_W,
+        )
+
+    def _panels(self, cells: pd.DataFrame, line: str, measure: str) -> pn.viewable.Viewable:
+        """The three panels under the forecast.
+
+        The heatmap gets the largest share because it is the only one of the three with two
+        dimensions in it.
+        """
+        day, route, where = PANEL_W
+        return pn.Row(
+            pn.Column("**The whole day, hour by hour**", self._profile(cells, day), width=day),
+            pn.Column(f"**Along the route, hour by hour**, {measure}",
+                      self._heatmap(cells, line, route), width=route),
+            pn.Column("**Every stop, worst of the day**",
+                      self._map(cells, line, where), width=where),
+            width=CONTENT_W,
         )
 
     def _episode_strip(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
@@ -662,7 +676,7 @@ class Explorer(param.Parameterized):
         drawn = pd.concat([predicted[c] for c in ("delay_min", "actual_min", "normal_min")])
         pad = max(0.6, 0.15 * (drawn.max() - drawn.min()))
         chart = (zero * band * usual * centre * truth * marks).opts(
-            height=360, responsive=True, show_grid=True, hooks=[no_scroll_zoom],
+            height=360, width=CONTENT_W, show_grid=True, hooks=[no_scroll_zoom],
             toolbar="above", ylim=(drawn.min() - pad, drawn.max() + pad), yticks=8,
             xticks=ticks, xrotation=35,
             xlabel="", ylabel="delay (minutes)", fontscale=style.FONTSCALE,
@@ -688,9 +702,10 @@ class Explorer(param.Parameterized):
             f"swallows the dashed line the model has run out of things to say.",
             styles={"font-size": "0.82em", "color": style.INK_SOFT, "max-width": "76ch"},
         )
-        return pn.Column(pn.pane.HoloViews(chart, sizing_mode="stretch_width"), caption)
+        return pn.Column(pn.pane.HoloViews(chart), caption, width=CONTENT_W)
 
-    def _heatmap(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
+    def _heatmap(self, cells: pd.DataFrame, line: str,
+                 width: int = PANEL_W[1]) -> pn.viewable.Viewable:
         """The route against the hour, coloured by whichever measure is selected.
 
         A long line has sixty or more stops, which makes an unreadable axis, so the rows are
@@ -761,7 +776,7 @@ class Explorer(param.Parameterized):
                 cmap=style.BLUE_RAMP if level else style.GAIN_RAMP,
                 clim=(0, 15) if level else (-10, 10),
                 alpha=hv.dim("evidence"),
-                colorbar=True, tools=[hover], height=400, responsive=True,
+                colorbar=True, tools=[hover], height=400, width=width,
                 hooks=[no_scroll_zoom], ylabel="stops in route order",
                 # The whole day, always. A range that follows the data makes two episodes
                 # look the same width when one lasted three hours and the other twelve.
@@ -781,9 +796,10 @@ class Explorer(param.Parameterized):
                if thin else ""),
             styles={"font-size": "0.78em", "color": style.INK_SOFT},
         )
-        return pn.Column(pn.pane.HoloViews(heat, sizing_mode="stretch_width"), note)
+        return pn.Column(pn.pane.HoloViews(heat), note, width=width)
 
-    def _map(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
+    def _map(self, cells: pd.DataFrame, line: str,
+             width: int = PANEL_W[2]) -> pn.viewable.Viewable:
         """Every stop of the line in route order, coloured by its worst hour that day."""
         worst = (
             cells.dropna(subset=["lat", "lon"])
@@ -823,12 +839,12 @@ class Explorer(param.Parameterized):
         xlim, ylim = self._map_bounds(worst)
         return pn.pane.HoloViews(
             (tiles * route * stops).opts(
-                height=400, responsive=True, fontscale=style.FONTSCALE,
+                height=400, width=width, fontscale=style.FONTSCALE,
                 xaxis=None, yaxis=None,
                 hooks=[no_scroll_zoom], toolbar="above",
                 xlim=xlim, ylim=ylim, title="",
             ),
-            sizing_mode="stretch_width",
+            width=width,
         )
 
     def _map_bounds(self, stops: pd.DataFrame) -> tuple[tuple, tuple]:
@@ -851,7 +867,8 @@ class Explorer(param.Parameterized):
         ) * 1.25
         return (cx - span / 2, cx + span / 2), (cy - span / 2, cy + span / 2)
 
-    def _profile(self, cells: pd.DataFrame) -> pn.viewable.Viewable:
+    def _profile(self, cells: pd.DataFrame,
+                 width: int = PANEL_W[0]) -> pn.viewable.Viewable:
         """The line hour by hour: how late, how much cancelled, how much was measured.
 
         Three stacked plots on a shared hour axis rather than two scales on one, because
@@ -888,19 +905,17 @@ class Explorer(param.Parameterized):
             # render time rather than when the object is built.
             limit = {"ylim": ylim} if ylim is not None else {}
             return (area * line * dots).opts(
-                responsive=True, height=135, ylabel=label, fontscale=0.75,
+                width=width, height=135, ylabel=label, fontscale=0.75,
                 xlabel="hour of day" if last else "", xticks=list(range(0, 24, 3)),
                 show_grid=True, toolbar=None, default_tools=[], **limit,
             )
 
         return pn.Column(
-            pn.pane.HoloViews(band("delay_min", "delay (min)", style.SERIES[0]),
-                              sizing_mode="stretch_width"),
+            pn.pane.HoloViews(band("delay_min", "delay (min)", style.SERIES[0])),
             pn.pane.HoloViews(band("cancelled_pct", "cancelled (%)", style.SERIES[1],
-                                   ylim=(0, 100)), sizing_mode="stretch_width"),
-            pn.pane.HoloViews(band("measured", "measured", style.INK_SOFT, last=True),
-                              sizing_mode="stretch_width"),
-            sizing_mode="stretch_width",
+                                   ylim=(0, 100))),
+            pn.pane.HoloViews(band("measured", "measured", style.INK_SOFT, last=True)),
+            width=width,
         )
 
     @param.depends(
@@ -978,14 +993,35 @@ def main_column(explorer: Explorer) -> list:
     ]
 
 
+PAGE_CSS = f"""
+body {{ background: {style.SURFACE}; margin: 0; }}
+.van-title {{
+    font-size: 1.15rem; font-weight: 600; color: {style.INK};
+    padding: 14px 0 10px 0; border-bottom: 1px solid {style.RULE}; margin-bottom: 14px;
+}}
+.van-controls {{ border-right: 1px solid {style.RULE}; padding-right: 18px; }}
+"""
+
+
 def layout() -> pn.viewable.Viewable:
+    """Controls beside the page rather than in a template sidebar.
+
+    FastListTemplate opens its sidebar after the first paint. Bokeh has measured the main
+    area by then and keeps the wider figure, so every chart overflowed the column it sits in
+    by about the width of the sidebar. A plain row is measured once and is right.
+    """
+    pn.config.raw_css.append(PAGE_CSS)
     explorer = Explorer()
     explorer.refresh()
-    return pn.template.FastListTemplate(
-        title="Swiss train disruptions",
-        sidebar=[pn.Column(*sidebar(explorer), width=250)],
-        main=[pn.Column(*main_column(explorer))],
-        raw_css=[f"body, .main, #main {{ background: {style.SURFACE}; }}"],
+    return pn.Row(
+        pn.Column(*sidebar(explorer), width=CONTROLS_W, css_classes=["van-controls"]),
+        pn.Column(
+            pn.pane.HTML("<div class='van-title'>Swiss train disruptions</div>"),
+            *main_column(explorer),
+            width=CONTENT_W,
+        ),
+        width=CONTROLS_W + CONTENT_W + 40,
+        margin=(0, 16),
     )
 
 
