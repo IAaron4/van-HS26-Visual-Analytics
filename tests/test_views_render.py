@@ -143,7 +143,7 @@ def test_hover_fields_all_exist(explorer, selected) -> None:
     """A tooltip pointing at a column that is not there shows ??? instead of a number."""
     import re
     row, cells = selected
-    heat = explorer._heatmap(cells, row["line"]).object
+    heat = explorer._heatmap(cells, row["line"])[0].object
     columns = set(heat.data.columns)
     tips = heat.opts.get("plot").kwargs["tools"][0].tooltips
     refs = {r for _, text in tips for r in re.findall(r"@(\w+)", text)}
@@ -154,7 +154,7 @@ def test_no_chart_hijacks_the_scroll_wheel(explorer, selected) -> None:
     """Bokeh activates the wheel zoom on its own, and then the page cannot be scrolled."""
     row, cells = selected
     panes = [explorer._forecast(cells, row["line"], row)[0],
-             explorer._heatmap(cells, row["line"]),
+             explorer._heatmap(cells, row["line"])[0],
              explorer._map(cells, row["line"])]
     for pane in panes:
         plot = hv.renderer("bokeh").get_plot(pane.object)

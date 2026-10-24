@@ -19,6 +19,7 @@ import pandas as pd
 import panel as pn
 import param
 from bokeh.models import HoverTool
+from bokeh.themes import Theme
 from holoviews import opts
 from holoviews.util.transform import lon_lat_to_easting_northing
 
@@ -29,6 +30,7 @@ import style
 
 pn.extension("tabulator", sizing_mode="stretch_width")
 hv.extension("bokeh")
+hv.renderer("bokeh").theme = Theme(json=style.bokeh_theme())
 
 PROCESSED = Path(__file__).resolve().parents[1] / "data" / "processed"
 CELLS = PROCESSED / "cells.parquet"
@@ -44,8 +46,11 @@ def no_scroll_zoom(plot, element) -> None:
     Bokeh leaves active_scroll on "auto" and then activates the only scroll tool there is, so
     scrolling over a chart zooms it instead of moving the page. The page is taller than a
     screen, so that has to go. The tool stays in the toolbar, one click away.
+
+    The Bokeh logo goes with it. It is the clearest library default on the page.
     """
     plot.state.toolbar.active_scroll = None
+    plot.state.toolbar.logo = None
 
 
 def condition_for(when: pd.Timestamp) -> str:
@@ -100,9 +105,17 @@ SWISS_BOUNDS_DEG = (5.8, 45.7, 10.6, 47.9)
 # nothing recognisable in it. Keeping a floor means there is always some geography around it.
 MIN_SPAN_M = 90_000.0
 
+# Short headers. Spelling the units into every column pushed the headers past their width,
+# so the units are said once in the line above the table instead.
+TABLE_TITLES = {
+    "line": "line", "route": "route", "start": "start", "hours": "hours",
+    "stations": "stops", "severity_h": "harm", "score": "score",
+    "worst_min": "worst", "started_at": "started at", "gain_min": "added",
+    "measured": "measured", "share": "measured %", "judged": "judged",
+}
+
 TABLE_COLUMNS = [
-    "line", "route", "start", "hours", "stations", "severity_h",
-    "score", "worst_min", "started_at", "gain_min", "measured", "share", "judged",
+    "line", "route", "start", "hours", "stations", "severity_h", "worst_min", "judged",
 ]
 
 
@@ -118,17 +131,51 @@ class Explorer(param.Parameterized):
     categories = param.ListSelector(default=[], objects=[])
     canton = param.Selector(default="all", objects=["all"])
 
-    rank_by = param.Selector(objects=list(model.RANKINGS), default="severity")
-    z_threshold = param.Number(3.0, bounds=(1.0, 15.0), step=0.5)
-    min_excess_min = param.Number(3.0, bounds=(0.0, 20.0), step=0.5)
-    min_measured = param.Integer(2, bounds=(1, 20))
-    min_share_real = param.Number(0.5, bounds=(0.0, 1.0), step=0.05)
-    cancel_weight = param.Number(0.0, bounds=(0.0, 20.0), step=1.0)
-    cancel_headway_multiple = param.Number(1.0, bounds=(0.0, 4.0), step=0.25)
-    baseline_weeks = param.Selector(objects=list(model.BASELINE_WEEKS), default=8)
+    rank_by = param.Selector(
+        objects=list(model.RANKINGS), default="severity", label="order the list by",
+        doc="Severity is delay carried by the trains that ran plus waiting caused by the ones "
+            "that did not. Peak score is the single worst cell. Reach is how far it spread.",
+    )
+    z_threshold = param.Number(
+        3.0, bounds=(1.0, 15.0), step=0.5, label="how far from normal",
+        doc="How many times its usual spread an hour has to be off before it counts. Lower "
+            "finds more and flags more ordinary days.",
+    )
+    min_excess_min = param.Number(
+        3.0, bounds=(0.0, 20.0), step=0.5, label="at least this many minutes late",
+        doc="On top of the threshold, an hour has to be this far above what the stop "
+            "normally runs at. Keeps statistically odd but harmless hours out.",
+    )
+    min_measured = param.Integer(
+        2, bounds=(1, 20), label="trains actually measured",
+        doc="How many arrivals must carry a real timestamp rather than an estimate before "
+            "an hour is trusted. Thinner hours are faded, not hidden.",
+    )
+    min_share_real = param.Number(
+        0.5, bounds=(0.0, 1.0), step=0.05, label="share of them measured",
+        doc="The fraction of arrivals in an hour that were measured rather than forecast.",
+    )
+    cancel_weight = param.Number(
+        0.0, bounds=(0.0, 20.0), step=1.0, label="count cancellations this much",
+        doc="A cancelled train contributes no delay, so a suspended line goes quiet instead "
+            "of spiking. Raise this to score the silence.",
+    )
+    cancel_headway_multiple = param.Number(
+        1.0, bounds=(0.0, 4.0), step=0.25, label="a cancellation costs this long a wait",
+        doc="In multiples of the gap between trains that hour. Losing the only train on an "
+            "hourly line costs an hour of waiting, one of eight costs seven minutes.",
+    )
+    baseline_weeks = param.Selector(
+        objects=list(model.BASELINE_WEEKS), default=8, label="weeks of history for normal",
+        doc="How far back the trailing window looks when working out what this stop at this "
+            "hour of this weekday usually does.",
+    )
 
     colour_by = param.Selector(
-        objects={"how late it was": "level", "where it was added": "gain"}, default="level"
+        objects={"how late it was": "level", "where it was added": "gain"}, default="level",
+        label="colour the route by",
+        doc="How late carries downstream unchanged, so it cannot say where a delay began. "
+            "Where it was added can.",
     )
     rows_by = param.Selector(
         objects={
@@ -136,24 +183,51 @@ class Explorer(param.Parameterized):
             "every station on the line": "all",
             "cantons": "canton",
         },
-        default="flagged",
+        default="flagged", label="rows show",
+        doc="Cantons lose the order of the route, which is what the view is for, so they are "
+            "there for long lines rather than as the default.",
     )
     map_extent = param.Selector(
-        objects={"around the line": "line", "all of Switzerland": "country"}, default="line"
+        objects={"around the line": "line", "all of Switzerland": "country"}, default="line",
+        label="map shows",
     )
-    basemap = param.Selector(objects=list(BASEMAPS), default="OpenStreetMap")
+    basemap = param.Selector(
+        objects=list(BASEMAPS), default="OpenStreetMap", label="background",
+    )
 
     # The model. Every one of these refits it rather than filtering its output.
-    pooling = param.Selector(objects=list(prop.POOLING), default="leg")
-    min_obs = param.Integer(60, bounds=(5, 2000), step=5)
-    conditioned = param.Boolean(True)
+    pooling = param.Selector(
+        objects={"each stop to the next": "leg", "one figure per line": "line",
+                 "one figure for the country": "global"},
+        default="leg", label="fit the model",
+        doc="Per stop pair is the most faithful and the noisiest. Per line is steadier and "
+            "blurs the difference between a stretch with slack and one without.",
+    )
+    min_obs = param.Integer(
+        60, bounds=(5, 2000), step=5, label="trains behind each fit",
+        doc="A stretch with fewer than this many measured runs borrows its line's figure "
+            "rather than fitting its own.",
+    )
+    conditioned = param.Boolean(
+        True, label="fit peak and off peak apart",
+        doc="A morning peak stretch of track behaves differently from the same track at "
+            "midnight. Off, one figure covers the whole day.",
+    )
     coverage = param.Selector(
         objects={"half the days": 0.5, "4 days in 5": 0.8, "9 days in 10": 0.9,
                  "19 days in 20": 0.95},
-        default=0.8,
+        default=0.8, label="how often the band should hold",
+        doc="Measured against real residuals rather than assumed. A true 19 in 20 needs "
+            "about ten times the spread here, not two.",
     )
-    start_from_actual = param.Boolean(True)
-    start_delay_min = param.Number(5.0, bounds=(0.0, 30.0), step=0.5)
+    start_from_actual = param.Boolean(
+        True, label="start from what was measured",
+        doc="Off, the forecast starts from the what-if delay below instead, so you can ask "
+            "what five minutes at the origin would have done.",
+    )
+    start_delay_min = param.Number(
+        5.0, bounds=(0.0, 30.0), step=0.5, label="what-if start, minutes late",
+    )
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -186,9 +260,13 @@ class Explorer(param.Parameterized):
         self.n_flagged = 0
 
         self.table = pn.widgets.Tabulator(
-            pd.DataFrame(columns=TABLE_COLUMNS), height=235, disabled=True,
+            pd.DataFrame(columns=TABLE_COLUMNS), height=200, disabled=True,
             show_index=False, selectable=1, theme="simple",
-            pagination="local", page_size=6,
+            pagination="local", page_size=5, titles=TABLE_TITLES,
+            # Size to content and stretch the last column. Sharing the width equally cut
+            # every header to three letters, and sizing to content alone pushed `judged`,
+            # the column saying whether this episode has been decided, off the right edge.
+            layout="fit_data_stretch",
         )
         self.table.param.watch(lambda _: self._draw_detail(), "selection")
         self.detail = pn.Column(sizing_mode="stretch_width")
@@ -396,16 +474,20 @@ class Explorer(param.Parameterized):
             f"{row['stations']} stations over {row['hours']} h, "
             f"{row['severity_h']:.1f} train-hours of delay."
         )
+        measure = "how late" if self.colour_by == "level" else "where delay was added"
         self.detail[:] = [
             header,
             self._forecast(cells, line, row),
-            self._judgement(row),
             pn.Row(
-                pn.Column("**Episodes on this line that day**", self._episode_strip(cells, line)),
-                pn.Column("**Along the route, hour by hour**", self._heatmap(cells, line)),
-                pn.Column("**Every stop, worst of the day**", self._map(cells, line)),
-                height=420, sizing_mode="stretch_width",
+                pn.Column("**The whole day, hour by hour**",
+                          self._profile(cells), styles={"flex": "25 1 0"}),
+                pn.Column(f"**Along the route, hour by hour**, {measure}",
+                          self._heatmap(cells, line), styles={"flex": "42 1 0"}),
+                pn.Column("**Every stop, worst of the day**",
+                          self._map(cells, line), styles={"flex": "33 1 0"}),
+                sizing_mode="stretch_width",
             ),
+            self._judgement(row),
         ]
 
     def _judgement(self, row: pd.Series) -> pn.viewable.Viewable:
@@ -418,35 +500,43 @@ class Explorer(param.Parameterized):
         key = incidents.key_of(row["line"], str(row["day"]), str(row["peak_hour"]))
         already = self._verdicts.get(key)
 
-        verdict = pn.widgets.RadioButtonGroup(
-            options=list(incidents.VERDICTS),
-            value=already or incidents.VERDICTS[0],
-            button_type="default", sizing_mode="stretch_width",
-        )
-        note = pn.widgets.TextInput(placeholder="what happened, if you know", name="")
-        save = pn.widgets.Button(name="Record", button_type="primary", width=110)
+        note = pn.widgets.TextInput(placeholder="what happened, if you know", name="", width=360)
         said = pn.pane.Markdown(
             f"Last recorded: **{already}**" if already else "Not judged yet.",
             styles={"font-size": "0.82em", "color": style.INK_SOFT},
         )
 
-        def record(_event) -> None:
-            incidents.append(INCIDENT_LOG, incidents.Entry(
-                line=row["line"], day=str(row["day"]), episode_start=str(row["peak_hour"]),
-                started_at=str(row["started_at"]), verdict=verdict.value, note=note.value,
-                predicted_end_min=self._last_prediction.get("predicted"),
-                actual_end_min=self._last_prediction.get("actual"),
-                pooling=self.pooling, min_obs=self.min_obs, conditioned=self.conditioned,
-            ))
-            self._verdicts = incidents.latest_verdicts(INCIDENT_LOG)
-            said.object = f"Recorded **{verdict.value}** just now."
-            note.value = ""
+        def record(verdict: str):
+            def clicked(_event) -> None:
+                incidents.append(INCIDENT_LOG, incidents.Entry(
+                    line=row["line"], day=str(row["day"]), episode_start=str(row["peak_hour"]),
+                    started_at=str(row["started_at"]), verdict=verdict, note=note.value,
+                    predicted_end_min=self._last_prediction.get("predicted"),
+                    actual_end_min=self._last_prediction.get("actual"),
+                    pooling=self.pooling, min_obs=self.min_obs, conditioned=self.conditioned,
+                ))
+                self._verdicts = incidents.latest_verdicts(INCIDENT_LOG)
+                said.object = f"Recorded **{verdict}** just now."
+                note.value = ""
+            return clicked
 
-        save.on_click(record)
+        # Separate buttons rather than a radio group. A radio group always has something
+        # selected, so the first verdict reads as the tool's own answer before anyone has
+        # judged anything, and the study is partly about whether people disagree with it.
+        buttons = []
+        for choice in incidents.VERDICTS:
+            button = pn.widgets.Button(
+                name=choice, width=160,
+                button_type="primary" if choice == already else "default",
+            )
+            button.on_click(record(choice))
+            buttons.append(button)
+
         return pn.Column(
-            pn.pane.Markdown("**Did the model get it right?**"),
-            verdict,
-            pn.Row(note, save, sizing_mode="stretch_width"),
+            pn.Row(
+                pn.pane.Markdown("**Did the model get it right?**", width=200),
+                *buttons, note,
+            ),
             said,
         )
 
@@ -462,6 +552,7 @@ class Explorer(param.Parameterized):
         shown = same_line[["start", "hours", "stations", "severity_h", "started_at"]].head(12)
         return pn.widgets.Tabulator(
             shown, height=360, disabled=True, show_index=False, theme="simple",
+            titles=TABLE_TITLES,
         )
 
     @property
@@ -506,7 +597,8 @@ class Explorer(param.Parameterized):
 
         # Start where the delay was first added, if that stop is on the route.
         names = [route.iloc[0]["from_name"], *route["to_name"].tolist()]
-        origin = row["started_at"] if row["started_at"] in names else names[0]
+        on_route = row["started_at"] in names
+        origin = row["started_at"] if on_route else names[0]
         start_at = names.index(origin)
         remaining = route.iloc[start_at:].reset_index(drop=True)
         if remaining.empty:
@@ -534,15 +626,14 @@ class Explorer(param.Parameterized):
         for column in ("delay_s", "lower_s", "upper_s"):
             predicted[column.replace("_s", "_min")] = (predicted[column] / 60).round(2)
 
-        ticks = [(i, s) for i, s in enumerate(predicted["station"]) if i % max(1, len(predicted) // 14) == 0]
-        hover = HoverTool(tooltips=[
+        every = max(1, -(-len(predicted) // 12))
+        ticks = [(i, s) for i, s in enumerate(predicted["station"]) if i % every == 0]
+        hover = HoverTool(mode="vline", tooltips=[
             ("", "@station"),
             ("model expects", "@delay_min{0.0} min"),
-            ("range", "@lower_min{0.0} to @upper_min{0.0}"),
+            ("band", "@lower_min{0.0} to @upper_min{0.0} min"),
             ("actually", "@actual_min{0.0} min"),
             ("normal here", "@normal_min{0.0} min"),
-            ("carried forward", "@a{0.00}"),
-            ("fitted at", "@level"),
         ])
         # delay_min first: the scatter takes its y from the first vdim, and the rest are
         # along for the tooltip.
@@ -550,25 +641,34 @@ class Explorer(param.Parameterized):
                  "normal_min", "a", "level"]
 
         band = hv.Area(
-            predicted, "step", ["lower_min", "upper_min"]
-        ).opts(color=style.SERIES[0], alpha=0.16, line_alpha=0)
-        centre = hv.Curve(predicted, "step", "delay_min").opts(
-            color=style.SERIES[0], line_width=2.5)
+            predicted, "step", ["lower_min", "upper_min"], label=f"{self.coverage:.0%} band"
+        ).opts(color=style.SERIES[0], alpha=0.10, line_alpha=0)
+        centre = hv.Curve(predicted, "step", "delay_min", label="model expects").opts(
+            color=style.SERIES[0], line_width=style.LINE_W + 0.5)
         marks = hv.Scatter(predicted, "step", vdims).opts(
-            color=style.SERIES[0], size=5, tools=[hover],
-            line_color=style.SURFACE, line_width=1)
-        truth = hv.Curve(predicted.dropna(subset=["actual_min"]), "step", "actual_min").opts(
-            color=style.SERIES[1], line_width=2.5, line_dash="dashed")
-        usual = hv.Curve(predicted.dropna(subset=["normal_min"]), "step", "normal_min").opts(
-            color=style.INK_SOFT, line_width=1.4, alpha=0.65, line_dash="dotted")
+            color=style.SERIES[0], size=8, tools=[hover],
+            line_color=style.SURFACE, line_width=2)
+        truth = hv.Curve(
+            predicted.dropna(subset=["actual_min"]), "step", "actual_min", label="what happened"
+        ).opts(color=style.SERIES[1], line_width=style.LINE_W + 0.5, line_dash="dashed")
+        usual = hv.Curve(
+            predicted.dropna(subset=["normal_min"]), "step", "normal_min", label="normal here"
+        ).opts(color=style.INK_SOFT, line_width=1.4, alpha=0.65, line_dash="dotted")
         zero = hv.HLine(0).opts(color=style.INK_SOFT, line_width=0.8, alpha=0.4)
 
-        chart = (zero * usual * band * centre * truth * marks).opts(
-            height=330, responsive=True, show_grid=True, hooks=[no_scroll_zoom],
-            gridstyle={"grid_line_alpha": 0.25}, xticks=ticks, xrotation=35,
-            xlabel="", ylabel="delay (minutes)", fontscale=0.8,
-            title=f"{line} from {origin}, starting from {source}",
-            legend_position="top_left",
+        # The band can run to five minutes either side of a route that only ever moves by two,
+        # and letting it set the y range leaves the comparison the chart exists for in a
+        # twentieth of the height. The lines set the range and the band clips at the frame.
+        drawn = pd.concat([predicted[c] for c in ("delay_min", "actual_min", "normal_min")])
+        pad = max(0.6, 0.15 * (drawn.max() - drawn.min()))
+        chart = (zero * band * usual * centre * truth * marks).opts(
+            height=360, responsive=True, show_grid=True, hooks=[no_scroll_zoom],
+            toolbar="above", ylim=(drawn.min() - pad, drawn.max() + pad), yticks=8,
+            xticks=ticks, xrotation=35,
+            xlabel="", ylabel="delay (minutes)", fontscale=style.FONTSCALE,
+            title=f"forecast from {origin}",
+            legend_position="top", legend_cols=4,
+            legend_opts={"orientation": "horizontal", "glyph_height": 14, "glyph_width": 22},
         )
         tail = predicted.iloc[-1]
         self._last_prediction = {
@@ -576,13 +676,17 @@ class Explorer(param.Parameterized):
             "actual": (None if pd.isna(tail["actual_min"])
                        else round(float(tail["actual_min"]), 2)),
         }
+        elsewhere = "" if on_route else (
+            f"The delay was first added at {row['started_at']}, which is not on this route, "
+            f"so the forecast starts at {origin} instead and says nothing about the stops "
+            f"before it. "
+        )
         caption = pn.pane.Markdown(
-            f"Dotted is what this route normally runs at, solid is what the model expects "
-            f"given the start, dashed is what happened at {peak_hour:%H:%M}. The band is "
-            f"wide enough to hold the truth {100 * self.coverage:.0f}% of the time, and widens "
-            f"with every leg, so where it "
+            f"{elsewhere}Starting from {source}, measured at {peak_hour:%H:%M}. "
+            f"The band is calibrated to hold the truth "
+            f"{100 * self.coverage:.0f}% of the time and widens with every leg, so where it "
             f"swallows the dashed line the model has run out of things to say.",
-            styles={"font-size": "0.82em", "color": style.INK_SOFT},
+            styles={"font-size": "0.82em", "color": style.INK_SOFT, "max-width": "76ch"},
         )
         return pn.Column(pn.pane.HoloViews(chart, sizing_mode="stretch_width"), caption)
 
@@ -633,8 +737,9 @@ class Explorer(param.Parameterized):
         # Hiding them would quietly claim the hour was fine when nothing was measured in it.
         share = (grid["measured"] / grid["trips"].replace(0, float("nan"))).fillna(0.0)
         enough = (grid["measured"] >= self.min_measured) & (share >= self.min_share_real)
-        grid["evidence"] = enough.map({True: 1.0, False: 0.35})
+        grid["evidence"] = enough.map({True: 1.0, False: 0.45})
         grid["share_measured"] = share.round(2)
+        thin = int((~enough).sum())
         rows = grid.sort_values("position", ascending=False)["row"].drop_duplicates().tolist()
 
         hover = HoverTool(tooltips=[
@@ -653,16 +758,30 @@ class Explorer(param.Parameterized):
                    "evidence", "share_measured"],
         ).opts(
             opts.HeatMap(
-                cmap="Blues" if level else "RdBu_r",
+                cmap=style.BLUE_RAMP if level else style.GAIN_RAMP,
                 clim=(0, 15) if level else (-10, 10),
                 alpha=hv.dim("evidence"),
                 colorbar=True, tools=[hover], height=400, responsive=True,
-                hooks=[no_scroll_zoom],
-                title="minutes late" if level else "minutes added since the previous stop",
-                fontscale=0.75, xticks=list(range(0, 24, 3)), toolbar="above",
+                hooks=[no_scroll_zoom], ylabel="stops in route order",
+                # The whole day, always. A range that follows the data makes two episodes
+                # look the same width when one lasted three hours and the other twelve.
+                xlim=(-0.5, 23.5),
+                colorbar_opts={
+                    "title": "min late" if level else "min added",
+                    "width": 12, "padding": 6, "label_standoff": 5,
+                    "major_label_overrides": {15: "15+"} if level else {},
+                },
+                title="", fontscale=style.FONTSCALE,
+                xticks=list(range(0, 24, 3)), toolbar="above",
             )
         )
-        return pn.pane.HoloViews(heat, sizing_mode="stretch_width")
+        note = pn.pane.Markdown(
+            f"{len(rows)} of {len(set(cells['station']))} stops shown"
+            + (f". {thin} cells are faded: too few trains measured to trust the number"
+               if thin else ""),
+            styles={"font-size": "0.78em", "color": style.INK_SOFT},
+        )
+        return pn.Column(pn.pane.HoloViews(heat, sizing_mode="stretch_width"), note)
 
     def _map(self, cells: pd.DataFrame, line: str) -> pn.viewable.Viewable:
         """Every stop of the line in route order, coloured by its worst hour that day."""
@@ -672,33 +791,42 @@ class Explorer(param.Parameterized):
             .agg(lat=("lat", "first"), lon=("lon", "first"),
                  worst_min=("median_delay_s", lambda s: round(s.max() / 60, 1)))
         )
-        order = self._stop_order[self._stop_order["line"] == line][["station", "position"]]
-        worst = worst.merge(order, on="station", how="left").sort_values("position")
+        order = self._stop_order[self._stop_order["line"] == line]
+        worst = worst.merge(
+            order[["station", "position", "on_main_route"]], on="station", how="left"
+        ).sort_values("position")
         if worst.empty:
             return pn.pane.Markdown("No coordinates for this line.")
 
         x, y = lon_lat_to_easting_northing(worst["lon"].to_numpy(), worst["lat"].to_numpy())
         worst = worst.assign(x=x, y=y)
 
-        route = hv.Path([worst[["x", "y"]].to_numpy()]).opts(
+        # Only the main route gets a connecting line. Stops served by another variant sit off
+        # it, and joining them in position order drew a fan across the country rather than a
+        # railway.
+        main = worst[worst["on_main_route"].fillna(False)]
+        route = hv.Path([main[["x", "y"]].to_numpy()] if len(main) > 1 else []).opts(
             color=style.INK_SOFT, line_width=2, alpha=0.45
         )
         hover = HoverTool(tooltips=[("", "@station"), ("worst hour", "@worst_min{0.0} min late")])
         stops = hv.Points(worst, ["x", "y"], ["station", "worst_min"]).opts(
-            color="worst_min", cmap="Blues", clim=(0, 15), size=9, tools=[hover],
-            line_color="#444444", line_width=0.8, colorbar=False,
+            color="worst_min", cmap=style.BLUE_RAMP, clim=(0, 15), size=12, tools=[hover],
+            line_color=style.SURFACE, line_width=2, colorbar=True,
+            colorbar_opts={"title": "min late", "width": 12, "padding": 6},
         )
         # Full opacity. Dimming a basemap that is already nearly white left nothing to see.
         if TILE_URL:
             tiles = hv.Tiles(TILE_URL)
         else:
             tiles = getattr(hv.element.tiles, BASEMAPS[self.basemap])()
+        tiles = tiles.opts(alpha=0.78)
         xlim, ylim = self._map_bounds(worst)
         return pn.pane.HoloViews(
             (tiles * route * stops).opts(
-                height=400, responsive=True, fontscale=0.8, xaxis=None, yaxis=None,
-                hooks=[no_scroll_zoom],
-                xlim=xlim, ylim=ylim, title=f"{line}: every stop",
+                height=400, responsive=True, fontscale=style.FONTSCALE,
+                xaxis=None, yaxis=None,
+                hooks=[no_scroll_zoom], toolbar="above",
+                xlim=xlim, ylim=ylim, title="",
             ),
             sizing_mode="stretch_width",
         )
@@ -762,16 +890,18 @@ class Explorer(param.Parameterized):
             return (area * line * dots).opts(
                 responsive=True, height=135, ylabel=label, fontscale=0.75,
                 xlabel="hour of day" if last else "", xticks=list(range(0, 24, 3)),
-                show_grid=True, gridstyle={"grid_line_alpha": 0.25},
-                toolbar=None, default_tools=[], **limit,
+                show_grid=True, toolbar=None, default_tools=[], **limit,
             )
 
-        panels = (
-            band("delay_min", "delay (min)", style.SERIES[0])
-            + band("cancelled_pct", "cancelled (%)", style.SERIES[1], ylim=(0, 100))
-            + band("measured", "measured", style.INK_SOFT, last=True)
+        return pn.Column(
+            pn.pane.HoloViews(band("delay_min", "delay (min)", style.SERIES[0]),
+                              sizing_mode="stretch_width"),
+            pn.pane.HoloViews(band("cancelled_pct", "cancelled (%)", style.SERIES[1],
+                                   ylim=(0, 100)), sizing_mode="stretch_width"),
+            pn.pane.HoloViews(band("measured", "measured", style.INK_SOFT, last=True),
+                              sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
         )
-        return pn.pane.HoloViews(panels.cols(1), sizing_mode="stretch_width")
 
     @param.depends(
         "scenario", "categories", "canton", "rank_by", "z_threshold", "min_excess_min",
@@ -782,32 +912,19 @@ class Explorer(param.Parameterized):
         found = self._episodes()
         return pn.pane.Markdown(
             f"{self._n_cells:,} cells &nbsp;|&nbsp; {self.n_flagged:,} flagged &nbsp;|&nbsp; "
-            f"{len(found):,} episodes &nbsp;|&nbsp; load {self.load_ms:.0f} ms &nbsp;|&nbsp; "
-            f"rescore **{self.score_ms:.0f} ms**"
+            f"top {len(self._shown)} of {len(found):,} episodes shown &nbsp;|&nbsp; "
+            f"load {self.load_ms:.0f} ms, rescore {self.score_ms:.0f} ms"
         )
 
 
-def layout() -> pn.viewable.Viewable:
-    explorer = Explorer()
-    explorer.refresh()
+def sidebar(explorer: Explorer) -> list:
+    """The controls, grouped by the question each group answers.
 
-    filters = pn.Row(
-        pn.widgets.Select.from_param(explorer.param.scenario, width=140),
-        pn.widgets.CheckBoxGroup.from_param(explorer.param.categories, inline=True),
-        pn.widgets.Select.from_param(explorer.param.canton, width=130),
-    )
-    parameters = pn.Column(
-        "### Model",
-        pn.pane.Markdown("Each of these refits the model.",
-                         styles={"font-size": "0.85em"}),
-        explorer.param.pooling,
-        explorer.param.min_obs,
-        explorer.param.conditioned,
-        explorer.param.coverage,
-        explorer.param.start_from_actual,
-        explorer.param.start_delay_min,
-        pn.layout.Divider(),
-        "### Finding episodes",
+    Finding episodes comes first because it produces what the table shows, and the model comes
+    second because it explains the episode you then pick.
+    """
+    return [
+        "### Which days to look at",
         explorer.param.rank_by,
         explorer.param.z_threshold,
         explorer.param.min_excess_min,
@@ -817,19 +934,58 @@ def layout() -> pn.viewable.Viewable:
         explorer.param.cancel_headway_multiple,
         explorer.param.baseline_weeks,
         pn.layout.Divider(),
-        "### Heatmap",
+        "### What the model expects",
+        pn.pane.Markdown("Each of these refits the model rather than filtering its output.",
+                         styles={"font-size": "0.85em", "color": style.INK_SOFT}),
+        explorer.param.pooling,
+        explorer.param.min_obs,
+        explorer.param.conditioned,
+        explorer.param.coverage,
+        explorer.param.start_from_actual,
+        explorer.param.start_delay_min,
+        pn.layout.Divider(),
+        "### Where the delay came from",
         explorer.param.colour_by,
         explorer.param.rows_by,
         pn.layout.Divider(),
         "### Map",
         explorer.param.map_extent,
         explorer.param.basemap,
-        width=250,
-    )
+    ]
+
+
+def main_column(explorer: Explorer) -> list:
+    """Filters, then the list, then whatever the selected row opens up, then the counters."""
+    return [
+        pn.FlexBox(
+            pn.widgets.Select.from_param(explorer.param.scenario, width=140),
+            pn.widgets.Select.from_param(explorer.param.canton, width=130),
+            pn.widgets.CheckBoxGroup.from_param(
+                explorer.param.categories, inline=True, name="Train category"),
+            align_items="start", gap="18px",
+        ),
+        pn.layout.Divider(margin=(2, 0, 8, 0)),
+        pn.pane.Markdown(
+            "Each row is one line on one day the algorithm thinks went wrong. "
+            "Harm is train-hours of delay, worst is the worst hour in minutes. "
+            "Pick one to see what the model expected.",
+            styles={"font-size": "0.86em", "color": style.INK_SOFT},
+        ),
+        explorer.table,
+        explorer.detail,
+        pn.layout.Divider(margin=(16, 0, 4, 0)),
+        explorer.status,
+    ]
+
+
+def layout() -> pn.viewable.Viewable:
+    explorer = Explorer()
+    explorer.refresh()
     return pn.template.FastListTemplate(
         title="Swiss train disruptions",
-        sidebar=[parameters],
-        main=[pn.Column(filters, explorer.status, explorer.table, explorer.detail)],
+        sidebar=[pn.Column(*sidebar(explorer), width=250)],
+        main=[pn.Column(*main_column(explorer))],
+        raw_css=[f"body, .main, #main {{ background: {style.SURFACE}; }}"],
     )
 
 
