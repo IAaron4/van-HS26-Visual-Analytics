@@ -38,6 +38,16 @@ LEGS = PROCESSED / "legs.parquet"
 INCIDENT_LOG = Path(__file__).resolve().parents[1] / "data" / "incident_log.jsonl"
 
 
+def no_scroll_zoom(plot, element) -> None:
+    """Keep the wheel zoom off the scroll wheel.
+
+    Bokeh leaves active_scroll on "auto" and then activates the only scroll tool there is, so
+    scrolling over a chart zooms it instead of moving the page. The page is taller than a
+    screen, so that has to go. The tool stays in the toolbar, one click away.
+    """
+    plot.state.toolbar.active_scroll = None
+
+
 def condition_for(when: pd.Timestamp) -> str:
     """The bucket a leg was fitted in. Must match CONDITION_SQL in prepare.py."""
     hour, weekday = when.hour, when.dayofweek
@@ -534,7 +544,9 @@ class Explorer(param.Parameterized):
             ("carried forward", "@a{0.00}"),
             ("fitted at", "@level"),
         ])
-        vdims = ["station", "delay_min", "lower_min", "upper_min", "actual_min",
+        # delay_min first: the scatter takes its y from the first vdim, and the rest are
+        # along for the tooltip.
+        vdims = ["delay_min", "station", "lower_min", "upper_min", "actual_min",
                  "normal_min", "a", "level"]
 
         band = hv.Area(
@@ -552,7 +564,7 @@ class Explorer(param.Parameterized):
         zero = hv.HLine(0).opts(color=style.INK_SOFT, line_width=0.8, alpha=0.4)
 
         chart = (zero * usual * band * centre * truth * marks).opts(
-            height=330, responsive=True, show_grid=True,
+            height=330, responsive=True, show_grid=True, hooks=[no_scroll_zoom],
             gridstyle={"grid_line_alpha": 0.25}, xticks=ticks, xrotation=35,
             xlabel="", ylabel="delay (minutes)", fontscale=0.8,
             title=f"{line} from {origin}, starting from {source}",
@@ -645,6 +657,7 @@ class Explorer(param.Parameterized):
                 clim=(0, 15) if level else (-10, 10),
                 alpha=hv.dim("evidence"),
                 colorbar=True, tools=[hover], height=400, responsive=True,
+                hooks=[no_scroll_zoom],
                 title="minutes late" if level else "minutes added since the previous stop",
                 fontscale=0.75, xticks=list(range(0, 24, 3)), toolbar="above",
             )
@@ -684,6 +697,7 @@ class Explorer(param.Parameterized):
         return pn.pane.HoloViews(
             (tiles * route * stops).opts(
                 height=400, responsive=True, fontscale=0.8, xaxis=None, yaxis=None,
+                hooks=[no_scroll_zoom],
                 xlim=xlim, ylim=ylim, title=f"{line}: every stop",
             ),
             sizing_mode="stretch_width",

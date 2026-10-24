@@ -84,6 +84,23 @@ def test_the_forecast_renders(explorer, selected) -> None:
     render(explorer._forecast(cells, row["line"], row))
 
 
+def test_the_forecast_draws_every_layer_against_the_delay_axis(explorer, selected) -> None:
+    """A text column first in the vdims silently becomes the y axis.
+
+    hv.Scatter takes its y from vdims[0], so listing station names there plots the markers on a
+    categorical axis and buries the chart under one tick label per stop. It still renders, so
+    only the dtype catches it.
+    """
+    row, cells = selected
+    chart = explorer._forecast(cells, row["line"], row)[0].object
+    for element in chart.traverse(lambda e: e, [hv.Element]):
+        if not element.vdims:
+            continue
+        y = element.vdims[0]
+        assert pd.api.types.is_numeric_dtype(element.dimension_values(y).dtype), \
+            f"{type(element).__name__} puts {y.name} on the y axis"
+
+
 @pytest.mark.parametrize("pooling", ["leg", "line", "global"])
 def test_the_forecast_renders_at_every_pooling_level(explorer, selected, pooling) -> None:
     row, cells = selected
@@ -131,6 +148,18 @@ def test_hover_fields_all_exist(explorer, selected) -> None:
     tips = heat.opts.get("plot").kwargs["tools"][0].tooltips
     refs = {r for _, text in tips for r in re.findall(r"@(\w+)", text)}
     assert not refs - columns, f"tooltip references missing columns: {refs - columns}"
+
+
+def test_no_chart_hijacks_the_scroll_wheel(explorer, selected) -> None:
+    """Bokeh activates the wheel zoom on its own, and then the page cannot be scrolled."""
+    row, cells = selected
+    panes = [explorer._forecast(cells, row["line"], row)[0],
+             explorer._heatmap(cells, row["line"]),
+             explorer._map(cells, row["line"])]
+    for pane in panes:
+        plot = hv.renderer("bokeh").get_plot(pane.object)
+        assert plot.state.toolbar.active_scroll is None, \
+            f"{type(pane.object).__name__} still zooms on scroll"
 
 
 def test_the_detail_column_has_the_four_panels(explorer) -> None:
