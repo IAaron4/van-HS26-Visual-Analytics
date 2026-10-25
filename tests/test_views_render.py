@@ -124,6 +124,30 @@ def test_the_heatmap_renders_every_way(explorer, selected, rows_by, colour_by) -
     render(explorer._heatmap(cells, row["line"]))
 
 
+def test_two_railways_sharing_a_code_come_apart() -> None:
+    """S9 is five unrelated railways. An episode has to keep only the one it started on."""
+    import app
+    import numpy as np
+    # Three stops near the origin, three a hundred kilometres away.
+    points = np.array([[0.0, 0.0], [8_000.0, 0.0], [16_000.0, 0.0],
+                       [300_000.0, 0.0], [308_000.0, 0.0], [316_000.0, 0.0]])
+    assert app._component(points, 0) == [0, 1, 2]
+    assert app._component(points, 4) == [3, 4, 5]
+
+
+def test_a_route_line_breaks_where_no_train_could_run() -> None:
+    """A line code can cover two railways, and joining them drew a line across the country."""
+    import app
+    near = pd.DataFrame({"x": [0.0, 5_000.0, 9_000.0], "y": [0.0, 0.0, 0.0]})
+    assert len(app._segments(near)) == 1
+
+    split = pd.DataFrame({"x": [0.0, 5_000.0, 400_000.0, 405_000.0], "y": [0.0] * 4})
+    assert len(app._segments(split)) == 2, "the long gap should break the line"
+
+    lonely = pd.DataFrame({"x": [0.0, 400_000.0], "y": [0.0, 0.0]})
+    assert app._segments(lonely) == [], "two stops a country apart are not a leg"
+
+
 @pytest.mark.parametrize("extent", ["line", "country"])
 def test_the_map_renders(explorer, selected, extent) -> None:
     row, cells = selected
@@ -155,7 +179,7 @@ def test_no_chart_hijacks_the_scroll_wheel(explorer, selected) -> None:
     row, cells = selected
     panes = [explorer._forecast(cells, row["line"], row)[0],
              explorer._heatmap(cells, row["line"])[0],
-             explorer._map(cells, row["line"])]
+             explorer._map(cells, row["line"])[0]]
     for pane in panes:
         plot = hv.renderer("bokeh").get_plot(pane.object)
         assert plot.state.toolbar.active_scroll is None, \

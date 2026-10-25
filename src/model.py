@@ -328,6 +328,12 @@ def _summarise(flagged: pd.DataFrame, params: Params = Params()) -> pd.DataFrame
         severity_s=("severity_s", "sum"),
     )
 
+    # Where the episode actually ran. A line code covers more than one railway in this data,
+    # so naming the episode after the line's busiest route sent a reader to the wrong canton.
+    ends = flagged.sort_values("position").groupby("episode")["station"].agg(["first", "last"])
+    episodes["from_station"] = ends["first"]
+    episodes["to_station"] = ends["last"]
+
     # Spatial spread times duration. Kept separate from severity so a wide, shallow disruption
     # can still be found by someone looking for one.
     episodes["reach"] = episodes["n_stations"] * (
@@ -369,7 +375,8 @@ def _summarise(flagged: pd.DataFrame, params: Params = Params()) -> pd.DataFrame
 # filters the scored frame by the episode id instead.
 _EPISODE_COLUMNS = [
     "episode", "line", "start", "end", "n_cells", "n_stations", "peak_score", "mean_score",
-    "worst_delay_s", "origin_station", "origin_hour", "origin_gain_s",
+    "worst_delay_s", "from_station", "to_station", "origin_station", "origin_hour",
+    "origin_gain_s",
     "n_trips", "n_measured", "n_cancelled", "share_real", "cancel_rate",
     "severity_s", "reach",
 ]

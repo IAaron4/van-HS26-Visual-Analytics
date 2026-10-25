@@ -26,6 +26,16 @@ STAT_COLUMNS = ["n", "sx", "sy", "sxy", "sxx", "syy"]
 
 POOLING = ("leg", "line", "global")
 
+# How a leg turns the delay it receives into the delay it passes on. All three are fitted from
+# the same sums, so switching between them is instant and the comparison is like for like.
+#
+#   fitted   delay_out = a * delay_in + b, both fitted
+#   drift    delay_out = delay_in + b, the leg adds a fixed amount whatever arrives
+#   hold     delay_out = delay_in, the persistence baseline the model has to beat
+#
+# Held out on February: fitted 22.2 s, hold 43.4 s. Drift sits between them.
+METHODS = ("fitted", "drift", "hold")
+
 # How many sigma the band actually needs to reach a given coverage, measured on 1136 predicted
 # stops across both scenarios rather than taken from the normal distribution.
 #
@@ -48,6 +58,7 @@ class Params:
     """What the user steers. Every one of these refits the model."""
 
     pooling: str = "leg"
+    method: str = "fitted"
     min_obs: int = 60
     conditioned: bool = True
     # How often the band should actually contain the truth. Not a sigma count, because the
@@ -57,6 +68,8 @@ class Params:
     def __post_init__(self) -> None:
         if self.pooling not in POOLING:
             raise ValueError(f"pooling must be one of {POOLING}")
+        if self.method not in METHODS:
+            raise ValueError(f"method must be one of {METHODS}")
         if self.min_obs < ABSOLUTE_MIN_N:
             raise ValueError(f"min_obs must be at least {ABSOLUTE_MIN_N}")
         if self.coverage not in COVERAGE_MULTIPLIER:
@@ -68,7 +81,7 @@ class Params:
         return COVERAGE_MULTIPLIER[self.coverage]
 
 
-def _fit_from_stats(stats: pd.DataFrame) -> pd.DataFrame:
+def _fit_from_stats(stats: pd.DataFrame, method: str = "fitted") -> pd.DataFrame:
     """Least squares slope, intercept and residual spread from sufficient statistics.
 
     The five sums carry everything a straight line fit needs, so pooling groups together is
@@ -82,8 +95,16 @@ def _fit_from_stats(stats: pd.DataFrame) -> pd.DataFrame:
     # forward unchanged is the honest answer there, not a slope fitted to a single point.
     degenerate = (var_x <= 0) | (n < ABSOLUTE_MIN_N)
 
-    a = np.where(degenerate, 1.0, (n * sxy - sx * sy) / var_x.where(var_x > 0, 1.0))
-    b = np.where(degenerate, 0.0, (sy - a * sx) / n)
+    if method == "hold":
+        a = np.ones(len(n))
+        b = np.zeros(len(n))
+    elif method == "drift":
+        # The slope is pinned at one, so the only thing fitted is how much the leg adds.
+        a = np.ones(len(n))
+        b = ((sy - sx) / n).to_numpy()
+    else:
+        a = np.where(degenerate, 1.0, (n * sxy - sx * sy) / var_x.where(var_x > 0, 1.0))
+        b = np.where(degenerate, 0.0, (sy - a * sx) / n)
 
     # Residual sum of squares, straight from the sums.
     rss = syy - b * sy - a * sxy
@@ -107,11 +128,13 @@ def fit(legs: pd.DataFrame, params: Params = Params()) -> pd.DataFrame:
     back to global, so every leg always has a usable coefficient and the fallback is recorded.
     """
     group = LEG_KEYS + (["condition"] if params.conditioned else [])
-    per_leg = _fit_from_stats(legs.groupby(group, observed=True)[STAT_COLUMNS].sum())
+    per_leg = _fit_from_stats(legs.groupby(group, observed=True)[STAT_COLUMNS].sum(),
+                              params.method)
 
     line_group = ["line"] + (["condition"] if params.conditioned else [])
-    per_line = _fit_from_stats(legs.groupby(line_group, observed=True)[STAT_COLUMNS].sum())
-    overall = _fit_from_stats(legs[STAT_COLUMNS].sum().to_frame().T)
+    per_line = _fit_from_stats(legs.groupby(line_group, observed=True)[STAT_COLUMNS].sum(),
+                               params.method)
+    overall = _fit_from_stats(legs[STAT_COLUMNS].sum().to_frame().T, params.method)
 
     if params.pooling == "global":
         chosen = per_leg.assign(**_broadcast(overall.iloc[0]), level="global")
@@ -171,6 +194,12 @@ def predict_route(
 
     delay = float(start_delay_s)
     variance = 0.0
+    # A leg the fit never saw carries the delay on, which is the honest point estimate. Giving
+    # it no scatter was not honest: the band then read as certain exactly where the model knows
+    # least. It gets the typical leg's scatter instead.
+    unknown_sigma = (
+        float(np.nanmedian(coefficients["sigma"])) if len(coefficients) else 0.0
+    )
     rows = [{
         "station": route.iloc[0]["from_name"], "bpuic": route.iloc[0]["from_stop"],
         "delay_s": delay, "lower_s": delay, "upper_s": delay, "a": np.nan, "level": "start",
@@ -179,7 +208,7 @@ def predict_route(
     for leg in route.itertuples(index=False):
         key = tuple(getattr(leg, k) for k in coefficients.index.names)
         if key not in coefficients.index:
-            a, b, sigma, level = 1.0, 0.0, float("nan"), "carried"
+            a, b, sigma, level = 1.0, 0.0, unknown_sigma, "carried"
         else:
             row = coefficients.loc[key]
             a, b, sigma, level = row["a"], row["b"], row["sigma"], row["level"]
@@ -195,13 +224,21 @@ def predict_route(
     return pd.DataFrame(rows)
 
 
-def route_legs(stop_order: pd.DataFrame, line: str, condition: str | None = None) -> pd.DataFrame:
-    """The ordered legs of a line's main route, ready to hand to predict_route."""
-    stops = (
-        stop_order[(stop_order["line"] == line) & stop_order["on_main_route"]]
-        .sort_values("position")
-        .reset_index(drop=True)
-    )
+def route_legs(
+    stop_order: pd.DataFrame,
+    line: str,
+    condition: str | None = None,
+    stations: set | None = None,
+) -> pd.DataFrame:
+    """The ordered legs of a route, ready to hand to predict_route.
+
+    Without `stations` this is the line's main route. With it, the route runs through those
+    stops instead, which is what an episode needs when the line code covers more than one
+    railway and the episode is not on the busiest of them.
+    """
+    on_line = stop_order["line"] == line
+    keep = stop_order["station"].isin(stations) if stations else stop_order["on_main_route"]
+    stops = stop_order[on_line & keep].sort_values("position").reset_index(drop=True)
     if len(stops) < 2:
         return pd.DataFrame(columns=["line", "from_stop", "to_stop", "from_name", "to_name"])
 

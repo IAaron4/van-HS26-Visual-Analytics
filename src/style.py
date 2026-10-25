@@ -27,8 +27,12 @@ DELAY_CMAP.set_bad(NO_DATA)
 
 # Blue to orange through a neutral grey. The two poles have to read as opposite, which two
 # cool hues do not, and the midpoint has to read as nothing.
+# A lighter neutral than NO_DATA, which already means "nothing recorded". Reusing that exact
+# grey would have made "no delay added here" and "nothing measured here" the same pixel.
+MIDPOINT = "#f0efec"
+
 GAIN_RAMP = [
-    "#2a78d6", "#5598e7", "#9ec5f4", "#cde2fb", NO_DATA,
+    "#2a78d6", "#5598e7", "#9ec5f4", "#cde2fb", MIDPOINT,
     "#f8d2c2", "#f3ac8b", "#ef8a5f", "#eb6834",
 ]
 

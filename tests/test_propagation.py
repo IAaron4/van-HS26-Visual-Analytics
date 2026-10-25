@@ -125,6 +125,28 @@ def test_a_shedding_route_brings_the_delay_down() -> None:
     assert out["delay_s"].is_monotonic_decreasing
 
 
+def test_holding_the_delay_beats_nothing_and_is_not_the_fit() -> None:
+    """The three methods have to actually differ, or the control is decoration."""
+    rng = np.random.default_rng(11)
+    x = rng.uniform(0, 600, 400)
+    legs = pd.DataFrame([stats(x, line_through(x, 0.7, 40, 30, seed=12))])
+
+    held = prop.fit(legs, prop.Params(method="hold")).iloc[0]
+    assert (held["a"], held["b"]) == (1.0, 0.0)
+
+    drift = prop.fit(legs, prop.Params(method="drift")).iloc[0]
+    assert drift["a"] == 1.0
+    assert drift["b"] != 0.0, "drift still fits how much the leg adds"
+
+    fitted = prop.fit(legs, prop.Params(method="fitted")).iloc[0]
+    assert fitted["a"] == pytest.approx(0.7, abs=0.05)
+
+
+def test_an_unknown_method_is_refused() -> None:
+    with pytest.raises(ValueError):
+        prop.Params(method="sarima")
+
+
 def test_a_wider_coverage_asks_for_a_wider_band() -> None:
     """The control has to mean something: more coverage, more band."""
     legs, coef = route(4), coefficients(1.0, 20.0, 4)
@@ -155,6 +177,15 @@ def test_an_unknown_leg_carries_the_delay_rather_than_guessing() -> None:
     out = prop.predict_route(route(3), 400.0, coef)
     assert out["level"].tolist()[1:] == ["leg", "carried", "carried"]
     assert out["delay_s"].iloc[-1] == pytest.approx(400.0 * 0.5)
+
+
+def test_a_leg_the_fit_never_saw_still_widens_the_band() -> None:
+    """The band used to stay pin sharp exactly where the model knew nothing."""
+    coef = coefficients(0.9, 30.0, 3).iloc[:1]
+    out = prop.predict_route(route(3), 400.0, coef)
+    width = out["upper_s"] - out["lower_s"]
+    assert out["level"].tolist()[2:] == ["carried", "carried"]
+    assert width.iloc[2] > width.iloc[1], "an unknown leg has to add uncertainty"
 
 
 def test_an_empty_route_is_not_an_error() -> None:
